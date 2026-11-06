@@ -168,7 +168,8 @@ class Keyboard:
         """Send one command and wait for the echo. Only whitelisted commands pass."""
         p = bytes(payload)
         allowed = (p[:4] == CMD_GET_PSD or p[:2] == bytes([0xAE, 0x01])
-                   or p[:2] == bytes([0xB6, 0x03]))  # AskTrigger (read-only)
+                   or p[:2] == bytes([0xB6, 0x03])   # AskTrigger (read-only)
+                   or (p[0] == 0xB6 and p[1] in (0x01, 0x04, 0x05)))  # trigger tables
         if not allowed:
             raise RuntimeError(f"Blocked: command {hexs(p[:4])} is not whitelisted in this tool")
         wire = bytes([REPORT_ID]) + p + bytes(63 - len(p))
@@ -421,6 +422,206 @@ def cmd_led(a):
         kb.close()
 
 
+# ---------------------------------------------------------------- trigger settings
+# protocol.md section 7: three 126-byte per-key tables, 1 byte per matrix position, 0.1 mm units.
+#   B6 01 actuation point   2..38 (0.2-3.8 mm), factory 20 (2.0 mm)
+#   B6 04 rapid-trigger press sensitivity    0..36, 0 = RT off
+#   B6 05 rapid-trigger release sensitivity  0..36, 0 = RT off
+# Sent as 3 packets: 04 B6 <sub> 00 <pkt> + 59/59/8 data bytes. The keyboard cannot report these
+# settings back, so the last values written are kept in ranked_state.json next to this script.
+TABLES = {"actuation": 0x01, "press": 0x04, "release": 0x05}
+FACTORY = {"actuation": 20, "press": 0, "release": 0}
+LIMITS = {"actuation": (2, 38), "press": (0, 36), "release": (0, 36)}
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ranked_state.json")
+
+ALIASES = {"backslash": "\\", "minus": "-", "equal": "=", "equals": "=", "lbracket": "[",
+           "rbracket": "]", "semicolon": ";", "quote": "'", "comma": ",", "period": ".",
+           "dot": ".", "slash": "/", "backspace": "Bksp", "delete": "Del", "capslock": "Caps",
+           "pageup": "PgUp", "pagedown": "PgDn", "win": "LWin", "cmd": "LWin"}
+
+
+def _load_state():
+    import json
+    try:
+        with open(STATE_FILE) as f:
+            s = json.load(f)
+        return {k: list(s[k]) for k in TABLES}, True
+    except (OSError, ValueError, KeyError):
+        return {k: [FACTORY[k]] * 126 for k in TABLES}, False
+
+
+def _save_state(state):
+    import json
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+
+def _parse_keys(spec):
+    if not spec or spec.lower() == "all":
+        return None  # all positions
+    by_name = {v.lower(): p for p, v in KEY_AT.items()}
+    out = []
+    for raw in spec.split(","):
+        n = raw.strip()
+        n = ALIASES.get(n.lower(), n).lower()
+        if n not in by_name:
+            sys.exit(f"Unknown key '{raw}'. Names: {', '.join(KEY_AT.values())} "
+                     f"(aliases: {', '.join(ALIASES)})")
+        out.append(by_name[n])
+    return out
+
+
+def _mm(name, v):
+    b = int(round(v * 10))
+    lo, hi = LIMITS[name]
+    if not lo <= b <= hi:
+        sys.exit(f"--{name} {v} mm is outside {lo/10:.1f}..{hi/10:.1f} mm")
+    if name == "actuation" and b > 36:
+        print(f"warning: actuation {v} mm is near the bottom; travel readings saturate around there")
+    if name in ("press", "release") and b == 1:
+        print(f"warning: {name} sensitivity 0.1 mm equals the sensor noise; expect phantom retriggers")
+    return b
+
+
+def _packets(sub, table):
+    data = bytes(table)
+    assert len(data) == 126 and all(0 <= x <= 38 for x in data)
+    for pkt, off in enumerate((0, 59, 118)):
+        chunk = data[off:off + 59]
+        yield bytes([0xB6, sub, 0x00, pkt]) + chunk
+
+
+def _write_tables(state, names, dry_run=False, verbose=False):
+    if dry_run:
+        for name in names:
+            for p in _packets(TABLES[name], state[name]):
+                print(f"would send ({name}):", hexs(bytes([REPORT_ID]) + p)[:120], "...")
+        return True
+    import time
+    kb = Keyboard()
+    try:
+        kb.handshake(verbose=verbose)
+        for name in names:
+            time.sleep(0.035)
+            for p in _packets(TABLES[name], state[name]):
+                time.sleep(0.02)
+                if not kb.send(p, verbose=verbose):
+                    print(f"No acknowledgement for {name} packet {p[3]} - stopping. "
+                          "Previous settings may be partly applied; re-run or use Fn2+Esc.")
+                    return False
+            print(f"  {name}: written")
+    finally:
+        kb.close()
+    return True
+
+
+def _summary(state):
+    def fmt(name, b):
+        if name != "actuation" and b == 0:
+            return "off"
+        return f"{b/10:.1f}"
+    print("key      actuation  RT press  RT release   (mm)")
+    for p in sorted(KEY_AT):
+        print(f"{KEY_AT[p]:<8} {fmt('actuation', state['actuation'][p]):>9} "
+              f"{fmt('press', state['press'][p]):>9} {fmt('release', state['release'][p]):>11}")
+
+
+def cmd_trigger_show(a):
+    state, known = _load_state()
+    if not known:
+        print("(nothing written by this tool yet - showing factory defaults; "
+              "the keyboard's real settings may differ)")
+    _summary(state)
+
+
+def cmd_trigger_set(a):
+    if a.actuation is None and a.press is None and a.release is None and a.rt is None:
+        sys.exit("Give at least one of --actuation, --press, --release, --rt (all in mm)")
+    state, known = _load_state()
+    keys = _parse_keys(a.keys)
+    if keys is not None and not known:
+        print("note: first write - the other keys will be sent as factory defaults "
+              "(actuation 2.0 mm, rapid trigger off)")
+    if a.rt is not None:
+        a.press = a.press if a.press is not None else a.rt
+        a.release = a.release if a.release is not None else a.rt
+    changed = []
+    for name in TABLES:
+        v = getattr(a, name)
+        if v is None:
+            continue
+        b = _mm(name, v)
+        for p in (keys if keys is not None else range(126)):
+            state[name][p] = b
+        changed.append(name)
+    # tables never written before still have to be consistent; send them all on first write
+    names = list(TABLES) if not known else changed
+    if _write_tables(state, names, a.dry_run, a.verbose) and not a.dry_run:
+        _save_state(state)
+        print("Saved. Check with:  python ranked.py travel   /   python ranked.py trigger show")
+
+
+def cmd_trigger_reset(a):
+    state = {k: [FACTORY[k]] * 126 for k in TABLES}
+    print("Writing factory values: actuation 2.0 mm, rapid trigger off, all keys")
+    if _write_tables(state, list(TABLES), a.dry_run, a.verbose) and not a.dry_run:
+        _save_state(state)
+
+
+def cmd_trigger_auto(a):
+    """Measure per-key rest noise, then set RT sensitivity >= noise + margin on each key."""
+    import time
+    base_press, base_release = _mm("press", a.rt), _mm("release", a.rt)
+    act = _mm("actuation", a.actuation) if a.actuation is not None else None
+    kb = Keyboard()
+    noise = {p: 0 for p in KEY_AT}
+    n = 0
+    try:
+        kb.handshake(verbose=a.verbose)
+        while kb._read(0):
+            pass
+        print(f"Measuring sensor noise for {a.seconds:.0f}s - DON'T touch the keyboard...")
+        end = time.time() + a.seconds
+        while time.time() < end:
+            t = _poll_table(kb)
+            if t is None:
+                continue
+            n += 1
+            for p in KEY_AT:
+                noise[p] = max(noise[p], t[p])
+            time.sleep(0.02)
+        lib().hid_write(kb.dev, bytes([REPORT_ID, 0xB6, 0x03, 0x00]) + bytes(60), 64)
+    finally:
+        kb.close()
+    if n < 10:
+        sys.exit("Too few readings; aborting without changes.")
+    touched = [KEY_AT[p] for p in KEY_AT if noise[p] > 5]
+    if touched:
+        sys.exit(f"Keys looked pressed during the measurement ({', '.join(touched)}); "
+                 "re-run without touching the keyboard. Nothing was written.")
+
+    state, known = _load_state()
+    print(f"\n{n} snapshots. key: noise -> RT press/release (mm)")
+    for p in sorted(KEY_AT):
+        floor = noise[p] + a.margin if noise[p] else 0
+        prs = max(base_press, floor) if base_press else 0
+        rel = max(base_release, floor) if base_release else 0
+        state["press"][p], state["release"][p] = min(prs, 36), min(rel, 36)
+        if act is not None:
+            state["actuation"][p] = max(act, noise[p] + 2)
+        if noise[p] or a.verbose:
+            print(f"  {KEY_AT[p]:<7} noise {noise[p]/10:.1f} -> {state['press'][p]/10:.1f}/"
+                  f"{state['release'][p]/10:.1f}")
+    if not any(noise.values()):
+        print("  no noise on any key")
+    if a.dry_run:
+        _write_tables(state, list(TABLES), dry_run=True)
+        return
+    if _write_tables(state, list(TABLES), False, a.verbose):
+        _save_state(state)
+        print("Saved.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Ranked Master 65% configurator (macOS)")
     ap.add_argument("-v", "--verbose", action="store_true", help="print raw bytes")
@@ -434,6 +635,28 @@ def main():
     tr.add_argument("--seconds", type=float, default=60)
     tr.add_argument("--interval", type=float, default=0.02, help="pause between polls")
     tr.set_defaults(fn=cmd_travel)
+
+    tg = sub.add_parser("trigger", help="actuation / rapid-trigger settings")
+    ts = tg.add_subparsers(dest="tcmd", required=True)
+    ts.add_parser("show").set_defaults(fn=cmd_trigger_show)
+    s = ts.add_parser("set", help="values in mm; --keys W,A,S,D (default all)")
+    s.add_argument("--actuation", type=float, help="0.2-3.8 mm (factory 2.0)")
+    s.add_argument("--press", type=float, help="RT press sensitivity 0-3.6 mm, 0=off")
+    s.add_argument("--release", type=float, help="RT release sensitivity 0-3.6 mm, 0=off")
+    s.add_argument("--rt", type=float, help="shortcut: same press+release sensitivity")
+    s.add_argument("--keys", help="comma list, e.g. W,A,S,D,Space (default: all)")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_trigger_set)
+    r = ts.add_parser("reset", help="write factory values (2.0 mm, RT off)")
+    r.add_argument("--dry-run", action="store_true")
+    r.set_defaults(fn=cmd_trigger_reset)
+    au = ts.add_parser("auto", help="measure noise, set RT sensitivity safely per key")
+    au.add_argument("--rt", type=float, required=True, help="desired RT sensitivity, mm")
+    au.add_argument("--actuation", type=float, help="optional actuation for all keys, mm")
+    au.add_argument("--seconds", type=float, default=30)
+    au.add_argument("--margin", type=int, default=2, help="tenths of mm above noise (default 2)")
+    au.add_argument("--dry-run", action="store_true")
+    au.set_defaults(fn=cmd_trigger_auto)
     p = sub.add_parser("led", help="set lighting mode")
     p.add_argument("--mode", type=int, required=True)
     p.add_argument("--speed", type=int, default=DEFAULT_SPEED)
