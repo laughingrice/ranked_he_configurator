@@ -383,6 +383,121 @@ def cmd_travel(a):
         print(f"\nNot pressed: {', '.join(untested)}")
 
 
+# HID keyboard usage IDs for the keys we can watch in rt-test
+HID_USAGE = {**{chr(ord("A") + i): 0x04 + i for i in range(26)},
+             **{str(i): 0x1E + i - 1 for i in range(1, 10)}, "0": 0x27,
+             "Enter": 0x28, "Esc": 0x29, "Bksp": 0x2A, "Tab": 0x2B, "Space": 0x2C, "-": 0x2D,
+             "=": 0x2E, "[": 0x2F, "]": 0x30, "\\": 0x31, ";": 0x33, "'": 0x34, ",": 0x36,
+             ".": 0x37, "/": 0x38, "Caps": 0x39, "Del": 0x4C, "End": 0x4D, "PgUp": 0x4B,
+             "PgDn": 0x4E, "Right": 0x4F, "Left": 0x50, "Down": 0x51, "Up": 0x52}
+
+
+def _key_state(r):
+    """Return set of pressed usages from a keyboard report, or None if not a key report."""
+    if len(r) >= 64 and r[0] in (1, 2):        # NKRO reports on interface 1 (ID 1/2)
+        return {b for b in r[2:64] if b}
+    if len(r) == 8 and r[1] == 0:               # boot report on interface 0
+        return {b for b in r[2:8] if b}
+    return None
+
+
+def cmd_rt_test(a):
+    """Read-only: watch one key's travel and the key presses/releases the keyboard reports."""
+    import time
+    pos = _parse_keys(a.key)
+    if not pos or len(pos) != 1:
+        sys.exit("--key takes exactly one key name")
+    pos = pos[0]
+    name = KEY_AT[pos]
+    usage = HID_USAGE.get(name)
+    if usage is None:
+        sys.exit(f"rt-test can't watch {name}; pick a letter, digit, Space, arrows, etc.")
+    L = lib()
+    kb = Keyboard()
+    # also open the other interface(s) so we see key events whichever report they use
+    extra = []
+    head = L.hid_enumerate(VID, PID)
+    node, paths = head, set()
+    while node:
+        d = node.contents
+        if d.usage_page != VENDOR_USAGE_PAGE:
+            paths.add(d.path)
+        node = d.next
+    if head:
+        L.hid_free_enumeration(head)
+    for p in paths:
+        h = L.hid_open_path(p)
+        if h:
+            extra.append(h)
+    state, _ = _load_state()
+    print(f"Watching {name}. Last written by this tool: actuation {state['actuation'][pos]/10:.1f}, "
+          f"RT press {state['press'][pos]/10:.1f}, RT release {state['release'][pos]/10:.1f} mm "
+          "(0.0 = off)")
+    print("Press slowly, bounce partway up and down without fully releasing. Ctrl+C to stop.\n")
+
+    def drain_keys():
+        nonlocal down
+        for h in [kb.dev] + extra:
+            while True:
+                buf = ctypes.create_string_buffer(64)
+                n = L.hid_read_timeout(h, buf, 64, 0)
+                if n <= 0:
+                    break
+                handle(buf.raw[:n])
+
+    depth, down, events = 0, False, 0
+    got = []
+
+    def handle(r):
+        nonlocal down, events
+        if r and (r[0] == 0xB7 or (r[0] == REPORT_ID and len(r) > 1 and r[1] == 0xB7)):
+            if r[0] == 0xB7:
+                r = bytes([REPORT_ID]) + r
+            got.append(r[5:64])
+            return
+        ks = _key_state(r)
+        if ks is None:
+            return
+        now = usage in ks
+        if now != down:
+            down = now
+            events += 1
+            sys.stdout.write(f"\r\033[K  {'PRESS  ' if now else 'RELEASE'} at {depth/10:.1f} mm\n")
+
+    try:
+        kb.handshake()
+        end = time.time() + a.seconds
+        last = None
+        while time.time() < end:
+            got.clear()
+            L.hid_write(kb.dev, bytes([REPORT_ID, 0xB6, 0x03, 0x01]) + bytes(60), 64)
+            t_end = time.time() + 0.15
+            while time.time() < t_end and sum(len(g) for g in got) < 126:
+                drain_keys()
+                time.sleep(0.003)
+            data = b"".join(got)
+            if len(data) >= 126:
+                depth = data[pos]
+                if depth != last:
+                    bar = "#" * (depth // 2)
+                    sys.stdout.write(f"\r\033[K{name} {depth/10:.1f} mm |{bar:<20}| "
+                                     f"{'DOWN' if down else 'up'}")
+                    sys.stdout.flush()
+                    last = depth
+            drain_keys()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        L.hid_write(kb.dev, bytes([REPORT_ID, 0xB6, 0x03, 0x00]) + bytes(60), 64)
+        for h in extra:
+            L.hid_close(h)
+        kb.close()
+    print(f"\n\n{events} press/release events seen.")
+    if events == 0:
+        print("No key events were visible to the script (macOS may hide them). "
+              "Paste this output - I'll switch to reading typed characters instead.")
+
+
 def cmd_modes(a):
     print("mode  speed  brightness  color")
     for o in LED_OPTS:
@@ -580,7 +695,23 @@ def cmd_trigger_auto(a):
         kb.handshake(verbose=a.verbose)
         while kb._read(0):
             pass
-        print(f"Measuring sensor noise for {a.seconds:.0f}s - DON'T touch the keyboard...")
+        print("Let go of all keys...", end="", flush=True)
+        # wait until every key has been back at rest (<= 0.2 mm) for 1 s, e.g. the Enter
+        # used to launch this command; give up after 15 s
+        quiet_since, give_up = None, time.time() + 15
+        while True:
+            t = _poll_table(kb)
+            if t is not None:
+                if max(t[p] for p in KEY_AT) <= 2:
+                    quiet_since = quiet_since or time.time()
+                    if time.time() - quiet_since >= 1.0:
+                        break
+                else:
+                    quiet_since = None
+            if time.time() > give_up:
+                sys.exit("\nA key never came back to rest within 15 s. Nothing was written.")
+            time.sleep(0.02)
+        print(f" ok.\nMeasuring sensor noise for {a.seconds:.0f}s - DON'T touch the keyboard...")
         end = time.time() + a.seconds
         while time.time() < end:
             t = _poll_table(kb)
@@ -635,6 +766,10 @@ def main():
     tr.add_argument("--seconds", type=float, default=60)
     tr.add_argument("--interval", type=float, default=0.02, help="pause between polls")
     tr.set_defaults(fn=cmd_travel)
+    rt = sub.add_parser("rt-test", help="read-only: show where one key presses/releases")
+    rt.add_argument("--key", required=True)
+    rt.add_argument("--seconds", type=float, default=60)
+    rt.set_defaults(fn=cmd_rt_test)
 
     tg = sub.add_parser("trigger", help="actuation / rapid-trigger settings")
     ts = tg.add_subparsers(dest="tcmd", required=True)
