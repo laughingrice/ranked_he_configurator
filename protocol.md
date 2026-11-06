@@ -268,3 +268,204 @@ If the firmware supports calibration, it is triggered on the keyboard itself (fo
   * The exact physical meaning of the "+2" offset in live travel values.
   * Whether firmware accepts B6 02.
   * Whether anything other than `0x46cdcd` calls vtable slot +0x2c. Only direct `push`-argument call sites were searched.
+
+---
+
+## 8. KB parameters (B5), key-matrix encoding (A0 02 04), persistence, macros (A7/A8)
+
+Static analysis only. Nothing was sent to the device. `cfg` is the per-profile settings block (ST_PROFILE, 0x30b4 bytes). `gVar` is the device template loaded from Dev.ini (`[mainwnd+0x1238]+0x34`).
+
+### 8.1 B5 SetKBParam (Q1)
+
+**Builder.** `0x46b770` takes 6 byte arguments. It builds `B5 a1 a2 a3 a4 a5 a6 00 01` (`0x46b787`–`0x46b7d8`) and sends it async with a 500 ms timeout. Trailing `00 01` are constants (`payload[7]=00`, `payload[8]=01`), meaning unknown [?].
+
+**Caller.** ApplySetting `0x46c713` (`nFlag & 0x60`) passes the cfg bytes in this order. The order is confirmed by the log format at `0x5da608`: `"SetKBParam: nTapOFF=%d, nTapTime=%d, nDebounceCnt=%d, nDebounceTime=%d, nMagicFN=%d, nCapsLkLED=%d"`.
+
+| Payload | Source | UI control (settings dialog; read-back at `0x44c460`, refresh at `0x44c000`) | Range / units | Default (`0x458c8c`–`0x458caf`, cfg block memset at `0x458bf5`) |
+|---|---|---|---|---|
+| `[1]` tapOn | `cfg+0x2d90` nTapOFF, sent as `(nTapOFF==0)` (`0x46c787`) | Checkbox `dlg+0x15d8` "Tap" page. Unchecked → nTapOFF=1 (`0x44c49d`–`0x44c4ad`) | 0/1 | nTapOFF=0 → **tapOn=1** |
+| `[2]` tapTime | `cfg+0x2d91` | Slider `dlg+0x1770`. Range **0..100** (`push 0x64` @ `0x449327`, `0x450060`). Label `"%d ms"` (`0x5d5bcc`) of **value×10** (`0x44b0a7`, `0x44c100`) | 10 ms steps, **0–1000 ms** | **0x1E = 300 ms** |
+| `[3]` debounce count | `cfg+0x2d92` | Slider `dlg+0x7af0` on the "Debounce" page. Range **0..5** (`push 5` @ `0x44977a`). Label plain `"%d"` | count | **2** |
+| `[4]` debounce time | `cfg+0x2d93` | Slider object `dlg+0x66d8` has handlers (`0x44b0e3`, label `"%d ms"`) but is **never created** in this build: no `0x450060`/`0x4507c0` call for it, so `[+0x20]==0` and the read-back at `0x44c4e4` skips it. The value is therefore never edited | ms [inf from label] | **2** |
+| `[5]` magicFN | `cfg+0x2d94` | 3 radio buttons `dlg+0x42d0/0x4468/0x4600` → 0/1/2 (`0x44c520`–`0x44c54d`). Captions are image-only; the meanings of 1 and 2 are not resolved [?]. Help text `tc_comment4`: "Magic FN … accessed by holding down the Caps Lock key" | 0..2 | **0** |
+| `[6]` capsLED | `cfg+0x2d95` | Checkbox `dlg+0x4798` "Capslock LED" (`tc_kb20`) | 0/1 | **0** |
+| `[7]`,`[8]` | constant `00 01` | — | — | — |
+
+**Not sent by B5.** `cfg+0x2d96` (sleep enable, word) and `cfg+0x2d98` (SleepTime in **seconds**, word) are edited on the "Sleep" page (`dlg+0x4930`/`0x4ac8`; label "Second"/"Min" from `tc_msg36/37`; default = Dev.ini `SleepTime`, default 0x3C, `0x40e2bb`, copied at `0x458cb6`). No device command reads them in OemDrv [obs: only refs are `0x44c331`, `0x44c3b3`, `0x44c56f`, `0x44c581`].
+
+**What "Tap" is.** Help text `tc_comment3`: "Tap Mode allows you to assign a single quick-tap function to any key … adjust the sensitivity threshold". The tap functions live in **layer index 3, filled from Dev.ini `[TAP]`** (`0x40e83e`, `gVar+0x1ef0`). `tapTime` is the threshold, so this is a tap-vs-hold dual-role: a press shorter than tapTime sends the TAP-layer function, otherwise the normal key [inf]. In the M68 Dev.ini `[TAP]` is empty.
+
+**Gating by Dev.ini.** Settings-dialog tab list is built at `0x4040c0`–`0x404255`. Pages are added only if `[gVar profile+0x28]==1` (keyboard).
+
+| Tab | Page | Condition |
+|---|---|---|
+| 1 | Device info | always |
+| 2 | **Tap** (`tc_kb8`) | only if **`ShowKeyTrigger == 0`** (`0x404111`) |
+| 3 | **Magic Fn** | only if **`ShowMagicFN != 0`** (`gVar+0x47a1`, ini default **1**, `0x40e309`) |
+| 4 | **Capslock LED** | always |
+| 5 | **Debounce** | only if **`ShowDebounce != 0`** (`gVar+0x47a2`, ini default **1**, `0x40e31d`) |
+| 6 | Sleep | only if device type `[+0x24]==2` (wireless [inf]) |
+| 7 | Reset | always |
+| 8 | Upgrade | always |
+
+There is no `[TAP]`-specific gate. On the M68 (`ShowKeyTrigger=1`, `ShowMagicFN=0`, `ShowDebounce=0`) only Device info, Capslock LED, Reset and Upgrade remain.
+
+**Does B5 still go out when pages are hidden? Yes.**
+* ApplySetting checks no Show* flag before B5 (`0x46c713`).
+* Every settings-page control requests flag **0x40** immediately, not gated by `ApplyNow`: checkboxes/radios at `0x44b500`… → `0x44b79f`/`0x44b7af`; sliders at `0x44b240` → `0x44b264`.
+* So toggling **Capslock LED** on an M68 sends the full `B5 01 1E 02 02 00 <caps> 00 01`, including the hidden tap/debounce/magicFN defaults.
+* Flag 0xFF (8.3) also includes 0x40.
+
+### 8.2 SetMatrix (`A0 02 04`) key encoding (Q2)
+
+**Data model.**
+* Every layer in cfg is 132 key slots × 20 bytes (`0xa50`) at `cfg+0x38 + L*0xa50`.
+* Slot dword0 = `type<<24 | code`.
+* For type 2 the slot also holds: `+4` = HID modifier bits, `+5` = VK1, `+6` = VK2, `+7` = original modifier VK (display).
+* For type 5 the slot holds `+4` = macro GUID.
+* Dirty-layer mask is `cfg+0x30` (bit L).
+* Layer count = Dev.ini `LayerNum` (`gVar+0x46d4`, must be ≤ 4, `0x40e29b`).
+
+**Dev.ini → slot** (parser `0x40f300`; `K<n>=type,code,x` in `[FN1]`/`[FN2]`/`[TAP]`; `[KEY]` has the same 3 fields after the 4 rectangle values, then the key index):
+* **type 2 (keyboard key).** `code` = **Windows VK**, `x` = modifier byte (HID bits).
+  * If VK is itself a modifier, it is converted to the bit and VK1 is cleared (jump table `0x40f580`/`0x40f55c`).
+  * Mapping: `10/A0`→`02` LShift, `11/A2`→`01` LCtrl, `12/A4`→`04` LAlt, `5B`→`08` LWin, `A1`→`20` RShift, `A3`→`10` RCtrl, `A5`→`40` RAlt, `5C`→`80` RWin. This is exactly the HID boot-report modifier byte.
+* **Other types.** dword0 = `type<<24 | code`. Type 9 also stores `x` at +4.
+* **Layers** (`0x40e700`–`0x40e87f`):
+
+  | Layer index | Source | Notes |
+  |---|---|---|
+  | 0 | `[KEY]` | |
+  | 1 | `[FN1]` | starts as an empty copy of layer 0 |
+  | 2 | `[FN2]` | |
+  | 3 | `[TAP]` | |
+
+  A pristine copy of layer 0 is kept at `gVar+0x3180` for "Reset key".
+
+**Wire encoding** (`0x46c0d0` FillMatrix, key encoder `0x46bc20` keyinfo_to_hardware_code).
+* Per layer the block is **126 records × 6 bytes = 756 bytes**. 126 = `[dev+0x25c]`, set to `0x7e` in the CDevLWKB ctor at `0x46a603`.
+* Record for a key: **`[keyIdx][c0][c1][c2][c3][00]`** at offset **`keyIdx*6`**. `keyIdx` = 8th field of the `[KEY]` line (key-table byte +8), `< 0x84`, else "Get Invaild keycode" (`0x46c315`). `c0..c3` = little-endian return of `0x46bc20`.
+* Slots with dword0==0 leave the record **all zero**, including the idx byte. The buffer is memset at `0x46c7b8`. This is likely "transparent / not remapped" in FN layers [inf].
+
+| Slot type | Record bytes `c0 c1 c2 c3` | Notes |
+|---|---|---|
+| 2 key, VK1==0xFA | `FF 00 00 00` | **Fn (Fn1 layer key)** (`0x46bcde`) |
+| 2 key, VK1==0xFB | `FE 00 00 00` | **Fn2** (`0x46bcf1`) |
+| 2 key / combo | `FC <mod> <HID(VK1)> <HID(VK2)>` | VK→HID via table `0x5d4ce8` (`0x45c140`; e.g. `41→04 'A'`, `1B→29 Esc`, `70→3A F1`, `25→50 Left`, `A2→E0` …). A modifier-only key with LWin bit and no VK gives `FC 08 E3 00` (`0x46bd0f`) |
+| 1 mouse | `B0` L, `B2` mid, `B1` R, `B3` fwd, `B4` back, `B9 02 00 00` dbl-click, `B9 03 00 00` (code 0x17), `B5` wheel↑, `B6` wheel↓, `B7` wheel←, `B8` wheel→ | codes 0x11..0x1C (table `0x46bf60`; names from `0x41b5e4`). `ms_rdbclick` (0x18) has **no** encoding → record rejected |
+| 3/4 media | code 0x21 player→`A0`, 0x22 play/pause→`93`, 0x23 stop→`94`, 0x24 prev→`95`, 0x25 next→`96`, 0x26 vol+→`90`, 0x27 vol−→`91`, 0x28 mute→`92`, 0x30→`A2` (mail [inf]), 0x31 calculator→`A4`, 0x32 explorer→`A1`, 0x33→`A5`, 0x34 home→`A3`, 0x35..0x39→`A6..AA` | table `0x46c068`; names table `0x41b4d8` |
+| 5 macro | `F3 <id> <cnt_hi> <cnt_lo>` (repeat N times), `F1 <id> 00 00` (repeat while held), `F0 <id> 00 00` (repeat until any key) | see 8.5 |
+| 8 special | `FB <sub> 00 00` or `BF 00 00 00` | see table below |
+
+**Type 8 special functions** (encoder table `0x46bfc4`/`0x46bf90`; names from icon paths `0x41b540`/`0x41b514`; palette built at `0x41ac71`–`0x41acf9`):
+
+| Code | Name (icon / text.xml) | Record |
+|---|---|---|
+| 0x01 | `led_color_loop` – Color cycle (`tc_kb22`) | `FB 09` |
+| 0x02 | `led_mode_sw` – Light switch (`tc_kb24`) [inf on caption] | `FB 0E` |
+| 0x04 | `led_speed_inc` – Speed + (`tc_kb26`) | `FB 07` |
+| 0x05 | `led_speed_dec` – Speed − (`tc_kb27`) | `FB 08` |
+| 0x06 | `led_lumi_inc` – Brightness + (`tc_kb28`) | `FB 04` |
+| 0x07 | `led_lumi_dec` – Brightness − (`tc_kb29`) | `FB 05` |
+| 0x08 | `led_mode_loop` – Mode cycle (`tc_kb23`) | `FB 00` |
+| 0x09 / 0x0A | (no palette entry) | `FB 01` / `FB 02` |
+| 0x0B | `led_pause` – Pause light (`tc_kb25`) | `FB 0D` |
+| 0x0C | `winlock` – Win key lock | `FB 10` |
+| 0xA2 | `disable` (`tc_key_off`) | `BF 00 00 00` |
+
+Fn and Fn2 are not type 8. They are type 2 with VK 0xFA / 0xFB (`0x41ab65`–`0x41ab9c`; Dev.ini `K59=0x02,0xFA`, `K61=0x02,0xFB`).
+
+**M68 examples.**
+* FN1 `K55=0x08,0x0C` → LWin key becomes `FB 10` (Win-lock).
+* FN2 `K26=0x08,0x08` → `[` = mode cycle `FB 00`.
+* FN2 `K27=0x08,0x02` → `]` = `FB 0E`.
+* FN2 `Z..M=0x04,0x22..0x28` → media.
+
+**Packets** (`0x46b2b0`):
+```
+payload: A0 02 04 <pkt 1..14> 0E <layerID> <54 bytes = 9 records> A5 00 00
+         [0] [1][2]  [3]       [4]  [5]       [6..59]               [60]
+```
+* Packet *p* carries keyIdx `9(p-1) … 9p-1`.
+* `A5` at payload[0x3c] immediately follows the data (`0x46b341`). It is constant in every packet, so it is a frame trailer/magic; nothing in OemDrv reads it [obs/inf].
+* Each layer is preceded by `Sleep(30)` and sent async with a 1000 ms timeout.
+
+**Layer IDs** (`0x46c94e`–`0x46c97e`):
+* `layerID = L+1`: **1 = base `[KEY]`, 2 = FN1, 3 = FN2, 4 = TAP**.
+* When `ShowKeyTrigger != 0`, layer index 3 is sent as **ID 5** instead of 4. On HE boards the firmware's tap layer is evidently slot 5 [inf].
+* Only layers with a bit set in `cfg+0x30` are sent. Any layer containing macro keys is force-dirtied when macros are rewritten (`0x46c8d3`–`0x46c909`), because `AA 00` frees all macros.
+
+### 8.3 Persistence (Q3)
+
+* **The protocol has no save / commit / store / profile-select command.** The complete command set is in §4. Every write (A0 02 04, A8, AE, B5, B6) is applied by the firmware itself; OemDrv never sends a follow-up commit.
+* **Connect sends only GetPSD** (§3). The device-open path (`0x46a730`) does not queue an apply. There are exactly 8 writers of the apply flag `[0x6189bc]` (`0x404bc7`, `0x41df48`, `0x4220d1`, `0x422333`, `0x42236a`, `0x42be83`, `0x443701`, `0x44b264`/`0x44b7af`), and all are UI actions. Settings are therefore **not re-sent on connect**. The UI shows the PC-side copy, not what the board holds; no readback command exists except live travel (B6 03).
+* **Apply worker.** Thread `0x404c80` ("Start apply thread") reads `{flag=[0x6189bc], data=[0x6189c4]}` and calls `vtbl+0x20` ApplySetting (`0x404d90`).
+
+| Flag | Requested by | Gated by ApplyNow |
+|---|---|---|
+| `0x80` | Key-trigger Apply button (`0x41df48`) | no |
+| `0x01` | Key-remap Apply button (`dlg+0xba0`, `0x42be83`) | no |
+| `0x01` | Key-remap actions `0x41a183`/`0x41a955` | yes |
+| `0x40` | Settings controls (`0x44b264`/`0x44b7af`) | no |
+| `0x02`/`0x12` | LED page (`0x4220d1`, `0x42236a`) | yes |
+| `0x10` | Per-key colour (`0x422333`, `0x422245`) | yes |
+| **`0xFF`** | **profile switch** (`0x417598`) and **profile import/download** (`0x411964` → `0x4436d0`, which also sets `cfg+0x30=0xF`) | yes |
+
+* **ApplyNow.** `Cfg.ini [OPT] ApplyNow` → `[0x6120c8]`, read at `0x40cb9f`. The shipped Cfg.ini has `ApplyNow=0`, so the gated paths, including profile switching, send nothing.
+* **Flag 0xFF includes 0x20.** ApplySetting runs the 0x20 branch **last** (`0x46cea1`): `A0 02 03` "ResetMatrix", then `AE 06` "ResetLED", *after* writing all layers, macros, LED and B5/B6. No other code requests 0x20. Either A0 02 03 / AE 06 are really "finish/commit" markers despite their log names, or a profile switch with ApplyNow=1 wipes what it just wrote [?]. Do not replay this sequence without testing.
+* **PC-side storage** (`0x6164a8` = app data dir):
+  * `<data>\<devfolder>\profile.dct` – the list of ST_PROFILE records (`0x30b4` bytes each, magic `0xFCAA1245` at +0, MD5 check `0x41191a`). The path uses the device folder name at `gVar+0x5a` (`0x440b5f`–`0x440b86`), so profiles are **per device model**. `.rak` export/import uses the same record (`0x4194bf`, `0x458d04`).
+  * `<data>\gSetting.dct` – **app-global** preferences, with no device component in the path (`0x459185`).
+  * `Register.dct` (registration), `mac.dct` (macro library), `game.dct`.
+
+### 8.4 Actuation vs. rapid trigger (Q4)
+
+**No adjustment is made.**
+* The only writers of `cfg+0x2ea4` are the slider and edit-box handlers (`0x41dbcc`, `0x41dbff`, `0x41e63f`, `0x41e6ac`), which store the raw tick value.
+* The sensitivity handlers (`0x41dc0b`–`0x41ddc0`) touch only `0x2fac`/`0x3030`.
+* ApplySetting sends `cfg+0x2ea4` unmodified (`0x46cdc4`), and there is no arithmetic between the tables anywhere.
+
+The observed behaviour (first press registers at actuation + press-sensitivity) is therefore implemented in firmware.
+
+### 8.5 Macros (A7/A8) (Q5)
+
+**Send sequence.** Inside flag 0x01, after the layers (`0x46c9ae`–`0x46cb63`), and only if at least 1 macro exists and at least 1 dirty-layer key references one:
+1. `AA 00` FreeMacroID(0) = free all. Then `Sleep(120)`.
+2. For each macro *j* (IDs assigned sequentially from 1 at apply time, "New Assign Buffer_ID" `0x46c39b`):
+   1. `Sleep(30)`.
+   2. SetMacro(`id=j+1`, data, size) `0x46b3a0`.
+   3. **`A7 <id> <(size+5)>>8> <(size+5)&FF>`** MallocMacroID (`0x46b530`). The reply must have `reply[2]==01`, otherwise "has no memory".
+   4. `Sleep(100)`.
+   5. *n* = ceil(size/57) packets **`A8 <id> 00 <pkt 1..n> <n> <len≤0x39> <data…>`**, each with `Sleep(20)` and async 1000 ms.
+
+**Macro blob** (serializer `0x46b920` StMacro_To_HdMacro; max 0x200 bytes per macro):
+```
+[0]      01                         constant
+[1..30]  00 × 30                    name area ("size … include name size" 0x5d9c70); zeroed in this build
+[31..]   events, in order:
+  key      : (02|03) <HID usage>    VK→HID via 0x5d4ce8; modifiers → E0..E7
+  mouse btn: (04|05) <1|2|3>        editor codes 0xF0/0xF1/0xF2 (L / R / M [inf])
+  wheel    : (08|09) 00             repeated N times (editor codes 0xF5/0xF6; event +8 = count)
+  delay    : 01 <ms_hi> <ms_lo>     emitted after any event whose delay (+4) > 0; 16-bit big-endian ms
+```
+* Editor event = 12 bytes: `+0` word code, `+2` word flag, `+4` dword delay, `+8` dword count.
+* Prefix byte is `2`/`4` when flag ≠ 0 and `3`/`5` when flag = 0 (`0x46bacc`, `0x46ba01`). So 02/04 = press and 03/05 = release, assuming the flag means "down" [inf; the recorder that sets the flag was not traced].
+
+**Binding a macro to a key.**
+* Slot type 5 with the macro GUID (`+4`). The macro is looked up in the library (`0x458520`).
+* The mode at macro `+0x10` selects the record (`0x46be64`–`0x46bea8`):
+
+  | Mode | Record | UI string |
+  |---|---|---|
+  | 0 | `F3` + 16-bit count (macro `+0x54`) | "Cycle times" |
+  | 1 | `F1` | "Cycle until the (held-down) key is released" |
+  | 2 | `F0` | "Cycle until any key pressed" |
+
+  The mode-to-string mapping assumes the UI order matches 0/1/2 [inf].
+* FillMatrix then writes the buffer ID into record byte 2 (`0x46c3da`), giving **`[keyIdx][F3|F1|F0][id][cnt_hi][cnt_lo][00]`**.
+
+**Limits.**
+* Total macro memory = Dev.ini `[OPT] MacroBufferSize` (default **0x1000 = 4096 bytes**, `0x40dac5`; not set in the M68 Dev.ini). Hard cap 0x2800 ("nMacroBufferSize > sizeof(bMacro)", `0x46c808`).
+* Allocation stops with "!!!!Macro buffer too small" when the running offset reaches it (`0x46c385`).
+* There is no separate slot-count limit; the ID is one byte. Only macros actually bound to keys are uploaded.
+* The device-side cost per macro is size+5 (A7 argument).
