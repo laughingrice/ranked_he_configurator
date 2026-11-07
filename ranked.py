@@ -1073,7 +1073,28 @@ def cmd_macro_delete(a):
         sys.exit(f"No macro '{name}'.")
     layers, known = _load_layers()
     if known and name in _macro_refs(layers):
-        sys.exit(f"'{name}' is bound to a key; unbind it first (map set ... --to default).")
+        if not a.force:
+            sys.exit(f"'{name}' is bound to a key; add --force to unbind it (keys go back to "
+                     "their factory setting) and delete it.")
+        factory = _default_layers()
+        changed = []
+        for L, recs in layers.items():
+            for p, r in enumerate(recs):
+                if r and r[0] == "M" and r[1] == name:
+                    recs[p] = factory[L][p]
+                    print(f"{L}: {KEY_AT.get(p, p)} -> {_describe(recs[p])}")
+                    if L not in changed:
+                        changed.append(L)
+        if not _apply_keymap(layers, changed, False, a.verbose):
+            sys.exit("Stopping; nothing deleted.")
+        if not _macro_refs(layers):        # no macros left in use: free their memory too
+            kb = Keyboard()
+            try:
+                kb.handshake()
+                kb.send(bytes([0xAA, 0x00]))
+            finally:
+                kb.close()
+        _save_layers(layers)
     del macros[name]
     _save_state({"macros": macros})
     print(f"Deleted '{name}'.")
@@ -1127,6 +1148,153 @@ def cmd_led(a):
     if r:
         _save_state({"lighting": {"mode": a.mode, "speed": a.speed, "brightness": a.brightness,
                                   "color": color}})
+
+
+# ---------------------------------------------------------------- per-key RGB
+# protocol.md section 4 ("SetLED(Game mode)"): packets with the same 8-byte header
+#   AE 01 00 00 <mode> <speed> <bright> FF   then up to 13 x [pos|0x80, R, G, B], list ends FF
+# Mode = Dev.ini GaoshouIndex (19), the official app's "game mode" with per-key colours.
+RGB_MODE = 19
+RGB_NAMES = {"off": "000000", "black": "000000", "white": "ffffff", "red": "ff0000",
+             "green": "00ff00", "blue": "0000ff", "yellow": "ffff00", "cyan": "00ffff",
+             "magenta": "ff00ff", "purple": "8000ff", "orange": "ff6000", "pink": "ff3080",
+             "teal": "00a0a0", "lime": "80ff00", "gold": "ffb000"}
+# key groups from Dev.ini GaoshouKey1..5 (Windows VK codes), usable as --keys game1..game5
+_GAOSHOU = ["1b,57,41,53,44,26,28,25,27",
+            "70,71,72,31,32,33,34,35,9,51,57,45,52,41,53,44,47,10,42,11,12,20,2c,21,22,24,23",
+            "31,32,33,34,35,36,37,51,57,45,52,54,41,53,44,46,47,10,43,56,11",
+            "31,32,33,34,35,36,37,51,57,45,52,41,53,44,46",
+            "57,52,41,53,44,10,11,12,26,28,25,27"]
+
+
+def _vk_to_pos(vk):
+    # Dev.ini groups use 10/11/12 for generic Shift/Ctrl/Alt -> left keys
+    vk = {0x10: 0xA0, 0x11: 0xA2, 0x12: 0xA4}.get(vk, vk)
+    return next((p for p, v in BASE_VK.items() if v == vk), None)
+
+
+RGB_GROUPS = {f"game{i + 1}": sorted({p for p in (_vk_to_pos(int(x, 16)) for x in g.split(","))
+                                      if p is not None}) for i, g in enumerate(_GAOSHOU)}
+RGB_GROUPS["wasd"] = [44, 64, 65, 66]
+RGB_GROUPS["arrows"] = [97, 117, 118, 119]
+RGB_GROUPS["numbers"] = list(range(22, 32))
+RGB_GROUPS["letters"] = [p for p, n in KEY_AT.items() if len(n) == 1 and n.isalpha()]
+RGB_GROUPS["mods"] = [84, 96, 105, 106, 107, 114, 115, 116, 63, 42, 76, 34]
+
+
+def _parse_rgb(c):
+    c = c.strip().lower().lstrip("#")
+    c = RGB_NAMES.get(c, c)
+    if len(c) != 6:
+        sys.exit(f"Colour '{c}': use a name ({', '.join(RGB_NAMES)}) or #rrggbb")
+    try:
+        return bytes.fromhex(c)
+    except ValueError:
+        sys.exit(f"Colour '{c}' isn't valid hex (#rrggbb)")
+
+
+def _rgb_keys(spec):
+    out = []
+    for part in _split_list(spec):
+        pl = part.strip().lower()
+        if pl == "all":
+            out += sorted(KEY_AT)
+        elif pl in RGB_GROUPS:
+            out += RGB_GROUPS[pl]
+        else:
+            out += _parse_keys(part)
+    return list(dict.fromkeys(out))
+
+
+def _rgb_packets(keys, brightness):
+    entries = [bytes([p | 0x80]) + bytes.fromhex(keys[str(p)]) for p in sorted(map(int, keys))]
+    header = bytes([0xAE, 0x01, 0x00, 0x00, RGB_MODE, 0x00, brightness, 0xFF])
+    chunks = [entries[i:i + 13] for i in range(0, len(entries), 13)] or [[]]
+    for i, ch in enumerate(chunks):
+        body = b"".join(ch)
+        if i == len(chunks) - 1:
+            body += b"\xFF"                                   # end of list
+        yield header + body
+
+
+def _send_rgb(keys, brightness, dry_run=False, verbose=False):
+    import time
+    pk = list(_rgb_packets(keys, brightness))
+    if dry_run:
+        print(f"would send {len(pk)} per-key packet(s), {len(keys)} keys:")
+        for p in pk:
+            print("  ", hexs(bytes([REPORT_ID]) + p)[:120], "...")
+        return True
+    kb = Keyboard()
+    try:
+        kb.handshake(verbose=verbose)
+        for p in pk:
+            time.sleep(0.01)
+            if not kb.send(p, verbose=verbose):
+                return False
+    finally:
+        kb.close()
+    return True
+
+
+def _rgb_state():
+    L = _read_state_file().get("lighting", {})
+    if L.get("color") == 0xFF:
+        return dict(L.get("keys", {})), L.get("brightness", DEFAULT_BRIGHTNESS)
+    return {}, L.get("brightness", DEFAULT_BRIGHTNESS)
+
+
+def _rgb_commit(keys, brightness, a):
+    if not 0 <= brightness <= MAX_LEVEL:
+        sys.exit(f"--brightness must be 0..{MAX_LEVEL}")
+    if _send_rgb(keys, brightness, a.dry_run, a.verbose) and not a.dry_run:
+        _save_state({"lighting": {"mode": RGB_MODE, "speed": 0, "brightness": brightness,
+                                  "color": 0xFF, "keys": keys}})
+        print("OK - written and saved.")
+
+
+def cmd_rgb_set(a):
+    keys, bright = _rgb_state()
+    if a.brightness is not None:
+        bright = a.brightness
+    if a.others:
+        oc = _parse_rgb(a.others).hex()
+        keys = {str(p): oc for p in KEY_AT}
+    targets = _rgb_keys(a.keys)
+    cols = [_parse_rgb(c).hex() for c in _split_list(a.color)]
+    if len(cols) == 1:
+        cols *= len(targets)
+    elif len(cols) != len(targets):
+        sys.exit(f"{len(targets)} keys but {len(cols)} colours: give one, or one per key")
+    for p, c in zip(targets, cols):
+        keys[str(p)] = c
+    keys = {k: v for k, v in keys.items() if v != "000000"}   # off = not listed
+    print(f"{len(targets)} key(s) set; {len(keys)} lit in total")
+    _rgb_commit(keys, bright, a)
+
+
+def cmd_rgb_off(a):
+    keys, bright = _rgb_state()
+    if a.keys:
+        for p in _rgb_keys(a.keys):
+            keys.pop(str(p), None)
+    else:
+        keys = {}
+    _rgb_commit(keys, bright, a)
+
+
+def cmd_rgb_show(a):
+    keys, bright = _rgb_state()
+    if not keys:
+        print("No per-key colours set by this tool (or lighting is in an effect mode).")
+        return
+    by = {}
+    for p, c in keys.items():
+        by.setdefault(c, []).append(KEY_AT.get(int(p), p))
+    names = {v: k for k, v in RGB_NAMES.items()}
+    print(f"brightness {bright}")
+    for c, ks in sorted(by.items(), key=lambda x: -len(x[1])):
+        print(f"  #{c} {names.get(c, ''):<8} {', '.join(ks)}")
 
 
 # ---------------------------------------------------------------- profiles
@@ -1227,20 +1395,27 @@ def cmd_profile_load(a):
 
     if "lighting" in only:
         L = p["lighting"]
-        payload = build_led(L["mode"], L["speed"], L["brightness"], L["color"])
-        if a.dry_run:
-            print("  lighting: would send", hexs(payload))
-        else:
-            kb = Keyboard()
-            try:
-                kb.handshake()
-                ok = kb.send(payload)
-            finally:
-                kb.close()
-            if not ok:
+        if L.get("color") == 0xFF:                       # per-key colours
+            if not _send_rgb(L.get("keys", {}), L["brightness"], a.dry_run, a.verbose):
                 sys.exit("  lighting: no acknowledgement - stopping")
-            _save_state({"lighting": L})
-            print("  lighting: written")
+            if not a.dry_run:
+                _save_state({"lighting": L})
+                print("  lighting (per-key): written")
+        else:
+            payload = build_led(L["mode"], L["speed"], L["brightness"], L["color"])
+            if a.dry_run:
+                print("  lighting: would send", hexs(payload))
+            else:
+                kb = Keyboard()
+                try:
+                    kb.handshake()
+                    ok = kb.send(payload)
+                finally:
+                    kb.close()
+                if not ok:
+                    sys.exit("  lighting: no acknowledgement - stopping")
+                _save_state({"lighting": L})
+                print("  lighting: written")
 
     if "triggers" in only:
         st = {k: list(p["triggers"][k]) for k in TABLES}
@@ -1650,6 +1825,21 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("info").set_defaults(fn=cmd_info)
     sub.add_parser("modes").set_defaults(fn=cmd_modes)
+    rg = sub.add_parser("rgb", help="per-key colours")
+    rgs = rg.add_subparsers(dest="rgcmd", required=True)
+    r1 = rgs.add_parser("set", help="e.g. rgb set --keys wasd --color red --others white")
+    r1.add_argument("--keys", required=True,
+                    help="keys, 'all', or groups: " + ", ".join(RGB_GROUPS))
+    r1.add_argument("--color", required=True, help="name or #rrggbb; list = one per key")
+    r1.add_argument("--others", help="first set every other key to this colour")
+    r1.add_argument("--brightness", type=int, help=f"0..{MAX_LEVEL}")
+    r1.add_argument("--dry-run", action="store_true")
+    r1.set_defaults(fn=cmd_rgb_set)
+    r2 = rgs.add_parser("off", help="turn keys off (default: all)")
+    r2.add_argument("--keys")
+    r2.add_argument("--dry-run", action="store_true")
+    r2.set_defaults(fn=cmd_rgb_off)
+    rgs.add_parser("show").set_defaults(fn=cmd_rgb_show)
     t = sub.add_parser("trigger-dump", help="read-only: dump the per-key trigger table (B6 03)")
     t.add_argument("--watch", type=float, default=1.0, help="seconds to listen (try 10 and press keys)")
     t.set_defaults(fn=cmd_trigger_dump)
@@ -1698,6 +1888,7 @@ def main():
     c2.set_defaults(fn=cmd_macro_show)
     c3 = mcs.add_parser("delete")
     c3.add_argument("name")
+    c3.add_argument("--force", action="store_true", help="also unbind it from any keys")
     c3.set_defaults(fn=cmd_macro_delete)
     c4 = mcs.add_parser("sync", help="re-upload bound macros (e.g. after Fn2+Esc)")
     c4.add_argument("--dry-run", action="store_true")
