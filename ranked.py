@@ -594,8 +594,13 @@ def _default_layers():
         fn2[p] = (m, 0, 0, 0)
     fn2[53] = (0xFB, 0x00, 0, 0)                        # Fn2+[ = LED mode cycle
     fn2[54] = (0xFB, 0x0E, 0, 0)                        # Fn2+] = LED switch
-    for p, vk in {116: 0xFB, 117: 0x25, 119: 0x27, 97: 0x26, 118: 0x28}.items():
-        fn2[p] = _rec_key(vk)
+    fn2[116] = _rec_key(0xFB)                           # Fn2 itself
+    # Dev.ini lists plain arrows here, but the keyboard's factory map (and keycaps) use
+    # lighting controls - confirmed on the device
+    fn2[117] = (0xFB, SPECIAL["led-speed-"], 0, 0)      # Fn2+Left
+    fn2[118] = (0xFB, SPECIAL["led-bright-"], 0, 0)     # Fn2+Down
+    fn2[119] = (0xFB, SPECIAL["led-speed+"], 0, 0)      # Fn2+Right
+    fn2[97] = (0xFB, SPECIAL["led-bright+"], 0, 0)      # Fn2+Up
     return {"base": base, "fn1": fn1, "fn2": fn2, "tap": [None] * 126}
 
 
