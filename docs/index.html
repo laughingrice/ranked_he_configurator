@@ -333,7 +333,8 @@ footer { margin: 28px 0 40px; color: var(--muted); font-size: 12.5px; }
   <section class="panel card stack" data-panel="music" hidden>
     <div><h2>Music-reactive lighting</h2>
       <div class="muted small">The page listens to audio, turns it into key colours and streams them to the keyboard
-        about 25 times a second. Stopping restores your saved lighting. Keep this tab visible while it runs:
+        about 25 times a second. Levels adapt to the music over a few seconds, so bars follow beats and
+        changes rather than overall loudness. Stopping restores your saved lighting. Keep this tab visible while it runs:
         browsers slow down hidden tabs.</div></div>
     <div class="grid2">
       <label class="field"><span>Audio source</span><select id="muSource">
@@ -347,7 +348,7 @@ footer { margin: 28px 0 40px; color: var(--muted); font-size: 12.5px; }
         <select id="muColorMode"><option value="grad">Green → red</option><option value="one">Single colour</option></select>
         <input type="color" id="muColor" value="#00a0ff"></div></label>
       <label class="field"><span>Sensitivity <b id="muGainV"></b></span><input type="range" id="muGain" min="1" max="30" value="10"></label>
-      <label class="field"><span>Smoothing <b id="muSmoothV"></b></span><input type="range" id="muSmooth" min="0" max="95" value="70"></label>
+      <label class="field"><span>Smoothing <b id="muSmoothV"></b></span><input type="range" id="muSmooth" min="0" max="95" value="30"></label>
       <label class="field"><span>Brightness <b id="muBrightV"></b></span><input type="range" id="muBright" min="10" max="100" value="100"></label>
     </div>
     <div class="row"><button class="btn primary" id="muStart">Start</button>

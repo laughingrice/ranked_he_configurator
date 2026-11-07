@@ -679,6 +679,8 @@ async function getAudio(src) {
   if (!st.getAudioTracks().length) throw new Error("No audio shared - pick a tab and tick “Share tab audio”.");
   return st;
 }
+// Levels adapt to the music: each band tracks its own recent quiet floor and loud peak, so
+// bars show *changes* (beats, entries) rather than absolute loudness. Fast attack, slow decay.
 function bandLevels() {
   const an = music.an, data = music.buf;
   an.getFloatFrequencyData(data);
@@ -686,10 +688,26 @@ function bandLevels() {
   const lv = [];
   for (let c = 0; c < MU_COLS; c++) {
     const a = Math.max(1, Math.floor(MU_EDGES[c] / hz)), b = Math.max(a + 1, Math.ceil(MU_EDGES[c + 1] / hz));
-    let m = -Infinity; for (let i = a; i < b && i < data.length; i++) m = Math.max(m, data[i]);
-    const tilt = c * 1.2;                                  // treble is quieter; lift it a bit
-    lv.push(Math.max(0, Math.min(1, ((m + tilt) + 85) / 55 * gain)));
+    let e = 0, n = 0;
+    for (let i = a; i < b && i < data.length; i++) { e += Math.pow(10, data[i] / 10); n++; }   // mean power
+    const db = n ? 10 * Math.log10(e / n + 1e-12) : -120;
+    // running floor/peak (dB): follow instantly in one direction, drift slowly in the other
+    music.peak[c] = Math.max(db, music.peak[c] - 0.08);
+    music.floor[c] = Math.min(db, music.floor[c] + 0.15);
+    const range = Math.max(10, music.peak[c] - music.floor[c]);
+    let v = Math.max(0, Math.min(1, (db - music.floor[c]) / range));
+    v = Math.min(1, Math.pow(v, 2) * gain);                          // stretch the top end
+    if (db < -95) v = 0;                                             // real silence
+    music.env[c] = v > music.env[c] ? v : music.env[c] * 0.72 + v * 0.28;   // fast up, quick fall
+    lv.push(music.env[c]);
   }
+  // beat detection on the bass (columns 0-2): energy well above its ~1 s average
+  const bass = (lv[0] + lv[1] + lv[2]) / 3;
+  music.bassAvg = music.bassAvg * 0.96 + bass * 0.04;
+  if (bass > music.bassAvg * 1.35 && bass > 0.25 && performance.now() - music.lastBeat > 180) {
+    music.flash = 1; music.lastBeat = performance.now(); music.beats++;
+  }
+  music.flash *= 0.84;
   return lv;
 }
 function renderFrame(lv, t) {
@@ -704,8 +722,8 @@ function renderFrame(lv, t) {
     } else if (eff === "rainbow") {
       rgb = hsv((c / MU_COLS + t / 8000) % 1, 1, Math.min(1, lv[c] * 1.3));
     } else {
-      const v = Math.pow(bass, 1.6);
-      rgb = (grad ? hsv((t / 12000) % 1, 1, 1) : one).map((x) => x * v);
+      const v = Math.max(music.flash, bass * 0.35);                   // flash on beats, glow with the bass
+      rgb = (grad ? hsv((music.beats * 0.13) % 1, 1, 1) : one).map((x) => x * v);
     }
     rgb.forEach((x, i) => { frame[k.pos * 3 + i] = Math.round(x * bright); });
   }
@@ -718,7 +736,9 @@ async function startMusic() {
   const ctx = new AudioContext(), an = ctx.createAnalyser();
   an.fftSize = 4096; an.smoothingTimeConstant = $("#muSmooth").value / 100;
   ctx.createMediaStreamSource(stream).connect(an);            // not connected to the speakers: no echo
-  music = { ctx, an, stream, buf: new Float32Array(an.frequencyBinCount), frames: 0, t0: performance.now(), busy: false };
+  music = { ctx, an, stream, buf: new Float32Array(an.frequencyBinCount), frames: 0, t0: performance.now(), busy: false,
+    peak: new Array(MU_COLS).fill(-60), floor: new Array(MU_COLS).fill(-60), env: new Array(MU_COLS).fill(0),
+    bassAvg: 0, flash: 0, lastBeat: 0, beats: 0 };
   stream.getAudioTracks()[0].addEventListener("ended", () => stopMusic());
   $("#muStart").textContent = "Stop"; $("#muStart").classList.remove("primary");
   log("tx", "music: streaming B1 frames (not logged individually)");
@@ -736,7 +756,7 @@ async function startMusic() {
     }
     if (TAB === "music") renderMusicKb();
     const fps = music.frames / ((performance.now() - music.t0) / 1000);
-    $("#muInfo").textContent = `${music.frames} frames · ${fps.toFixed(0)} fps`;
+    $("#muInfo").textContent = `${fps.toFixed(0)} fps · ${music.beats} beats detected`;
     music.timer = setTimeout(tick, Math.max(5, 40 - (performance.now() - t)));   // aim for ~25 fps
   };
   tick();
