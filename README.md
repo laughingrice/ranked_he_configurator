@@ -115,7 +115,7 @@ python ranked.py map reset --layer fn2|all
 ### Macros
 
 ```sh
-python ranked.py macro add sig 'text:"Best, Micha" 200ms enter'
+python ranked.py macro add sig 'text:"Hello world" 200ms enter'
 python ranked.py macro add zoom 'cmd+= 100ms cmd+=' --gap 20
 python ranked.py macro add scroll 'wheel:down*5 100ms click:right'
 python ranked.py map set --layer fn2 --key 1 --to macro:sig          # play once
