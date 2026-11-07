@@ -169,7 +169,10 @@ class Keyboard:
         p = bytes(payload)
         allowed = (p[:4] == CMD_GET_PSD or p[:2] == bytes([0xAE, 0x01])
                    or p[:2] == bytes([0xB6, 0x03])   # AskTrigger (read-only)
-                   or (p[0] == 0xB6 and p[1] in (0x01, 0x04, 0x05)))  # trigger tables
+                   or (p[0] == 0xB6 and p[1] in (0x01, 0x04, 0x05))  # trigger tables
+                   or (p[0] == 0xB5 and len(p) == 9 and p[7:9] == b"\x00\x01")  # options
+                   or (p[:3] == bytes([0xA0, 0x02, 0x04]) and len(p) == 61
+                       and p[4] == 0x0E and p[5] in (1, 2, 3, 5) and p[60] == 0xA5))  # keymap
         if not allowed:
             raise RuntimeError(f"Blocked: command {hexs(p[:4])} is not whitelisted in this tool")
         wire = bytes([REPORT_ID]) + p + bytes(63 - len(p))
@@ -498,6 +501,276 @@ def cmd_rt_test(a):
               "Paste this output - I'll switch to reading typed characters instead.")
 
 
+# ---------------------------------------------------------------- key remapping (A0 02 04)
+# protocol.md 8.2: per layer 126 records x 6 bytes = [keyIdx][c0 c1 c2 c3][00] at keyIdx*6,
+# all-zero record = not set (transparent in Fn/tap layers). 14 packets of 9 records:
+#   A0 02 04 <pkt 1..14> 0E <layerID> <54 bytes> A5   (layer IDs: base 1, fn1 2, fn2 3, tap 5)
+LAYER_IDS = {"base": 1, "fn1": 2, "fn2": 3, "tap": 5}
+
+VK_HID = {**{0x41 + i: 0x04 + i for i in range(26)},                      # A-Z
+          **{0x31 + i: 0x1E + i for i in range(9)}, 0x30: 0x27,            # 1-9, 0
+          **{0x70 + i: 0x3A + i for i in range(12)},                      # F1-F12
+          0x0D: 0x28, 0x1B: 0x29, 0x08: 0x2A, 0x09: 0x2B, 0x20: 0x2C, 0xBD: 0x2D, 0xBB: 0x2E,
+          0xDB: 0x2F, 0xDD: 0x30, 0xDC: 0x31, 0xBA: 0x33, 0xDE: 0x34, 0xC0: 0x35, 0xBC: 0x36,
+          0xBE: 0x37, 0xBF: 0x38, 0x14: 0x39, 0x2C: 0x46, 0x91: 0x47, 0x13: 0x48, 0x2D: 0x49,
+          0x24: 0x4A, 0x21: 0x4B, 0x2E: 0x4C, 0x23: 0x4D, 0x22: 0x4E, 0x27: 0x4F, 0x25: 0x50,
+          0x28: 0x51, 0x26: 0x52, 0x90: 0x53, 0x5D: 0x65}
+HID_NAME = {}
+MOD_BITS = {"lctrl": 0x01, "lshift": 0x02, "lalt": 0x04, "lwin": 0x08,
+            "rctrl": 0x10, "rshift": 0x20, "ralt": 0x40, "rwin": 0x80}
+VK_MOD = {0xA2: 0x01, 0x11: 0x01, 0xA0: 0x02, 0x10: 0x02, 0xA4: 0x04, 0x12: 0x04, 0x5B: 0x08,
+          0xA3: 0x10, 0xA1: 0x20, 0xA5: 0x40, 0x5C: 0x80}
+
+# names usable in --to (case-insensitive)
+TARGET_HID = {**{chr(ord("a") + i): 0x04 + i for i in range(26)},
+              **{str(i): 0x1E + i - 1 for i in range(1, 10)}, "0": 0x27,
+              **{f"f{i}": 0x39 + i for i in range(1, 13)},
+              "enter": 0x28, "esc": 0x29, "bksp": 0x2A, "backspace": 0x2A, "tab": 0x2B,
+              "space": 0x2C, "-": 0x2D, "minus": 0x2D, "=": 0x2E, "equal": 0x2E, "[": 0x2F,
+              "]": 0x30, "\\": 0x31, "backslash": 0x31, ";": 0x33, "'": 0x34, "`": 0x35,
+              "grave": 0x35, ",": 0x36, ".": 0x37, "/": 0x38, "caps": 0x39, "capslock": 0x39,
+              "printscreen": 0x46, "prtsc": 0x46, "scrolllock": 0x47, "pause": 0x48,
+              "insert": 0x49, "ins": 0x49, "home": 0x4A, "pgup": 0x4B, "del": 0x4C,
+              "delete": 0x4C, "end": 0x4D, "pgdn": 0x4E, "right": 0x4F, "left": 0x50,
+              "down": 0x51, "up": 0x52, "numlock": 0x53, "menu": 0x65, "app": 0x65,
+              # numpad (the official app offers these too)
+              "kp/": 0x54, "kp*": 0x55, "kp-": 0x56, "kp+": 0x57, "kpenter": 0x58,
+              "kpplus": 0x57, "kpminus": 0x56, "kpslash": 0x54, "kpstar": 0x55, "kpdot": 0x63,
+              **{f"kp{i}": 0x58 + i for i in range(1, 10)}, "kp0": 0x62, "kp.": 0x63,
+              # F13-F24: not offered by the official app (untested), handy as macOS shortcut keys
+              **{f"f{i}": 0x68 + i - 13 for i in range(13, 25)}}
+MOD_ALIASES = {"ctrl": "lctrl", "shift": "lshift", "alt": "lalt", "opt": "lalt", "option": "lalt",
+               "win": "lwin", "cmd": "lwin", "gui": "lwin", "rcmd": "rwin", "ropt": "ralt"}
+MEDIA = {"player": 0xA0, "play": 0x93, "playpause": 0x93, "stop": 0x94, "prev": 0x95,
+         "next": 0x96, "volup": 0x90, "voldown": 0x91, "mute": 0x92, "calc": 0xA4}
+MOUSE = {"mouse-left": 0xB0, "mouse-right": 0xB1, "mouse-middle": 0xB2, "mouse-forward": 0xB3,
+         "mouse-back": 0xB4, "wheel-up": 0xB5, "wheel-down": 0xB6, "wheel-left": 0xB7,
+         "wheel-right": 0xB8}
+SPECIAL = {"led-mode-cycle": 0x00, "led-bright+": 0x04, "led-bright-": 0x05, "led-speed+": 0x07,
+           "led-speed-": 0x08, "led-color-cycle": 0x09, "led-pause": 0x0D, "led-switch": 0x0E,
+           "winlock": 0x10}
+for _n, _u in TARGET_HID.items():
+    HID_NAME.setdefault(_u, _n)
+
+
+def _rec_key(vk, mods=0):
+    """Encode a Dev.ini type-2 entry (Windows VK) the way OemDrv's 0x46bc20 does."""
+    if vk == 0xFA:
+        return (0xFF, 0, 0, 0)
+    if vk == 0xFB:
+        return (0xFE, 0, 0, 0)
+    if vk in VK_MOD:
+        bit = VK_MOD[vk] | mods
+        return (0xFC, bit, 0xE3 if vk == 0x5B else 0x00, 0x00)
+    return (0xFC, mods, VK_HID[vk], 0x00)
+
+
+# Dev/kb/M68/US/Dev.ini defaults, keyed by device position (\ at 55, not the ini's 75)
+BASE_VK = {21: 0x1B, 22: 0x31, 23: 0x32, 24: 0x33, 25: 0x34, 26: 0x35, 27: 0x36, 28: 0x37,
+           29: 0x38, 30: 0x39, 31: 0x30, 32: 0xBD, 33: 0xBB, 34: 0x08, 35: 0x2E, 42: 0x09,
+           43: 0x51, 44: 0x57, 45: 0x45, 46: 0x52, 47: 0x54, 48: 0x59, 49: 0x55, 50: 0x49,
+           51: 0x4F, 52: 0x50, 53: 0xDB, 54: 0xDD, 55: 0xDC, 56: 0x23, 63: 0x14, 64: 0x41,
+           65: 0x53, 66: 0x44, 67: 0x46, 68: 0x47, 69: 0x48, 70: 0x4A, 71: 0x4B, 72: 0x4C,
+           73: 0xBA, 74: 0xDE, 76: 0x0D, 77: 0x21, 84: 0xA0, 86: 0x5A, 87: 0x58, 88: 0x43,
+           89: 0x56, 90: 0x42, 91: 0x4E, 92: 0x4D, 93: 0xBC, 94: 0xBE, 95: 0xBF, 96: 0xA1,
+           97: 0x26, 98: 0x22, 105: 0xA2, 106: 0x5B, 107: 0xA4, 111: 0x20, 114: 0xA5, 115: 0xFA,
+           116: 0xFB, 117: 0x25, 118: 0x28, 119: 0x27}
+
+
+def _default_layers():
+    base = [None] * 126
+    for p, vk in BASE_VK.items():
+        base[p] = _rec_key(vk)
+    fn1 = [None] * 126
+    for p, vk in {21: 0xC0, 35: 0x2D, 56: 0x24, 77: 0x2C, 98: 0x13, 115: 0xFA, 42: 0x09,
+                  63: 0x14, 76: 0x0D, 84: 0xA0, 96: 0xA5, 105: 0xA2, 107: 0xA4,
+                  114: 0xA3}.items():
+        fn1[p] = _rec_key(vk)
+    for i in range(12):
+        fn1[22 + i] = _rec_key(0x70 + i)
+    fn1[106] = (0xFB, 0x10, 0, 0)                       # Fn1+LWin = Win lock
+    fn2 = [None] * 126
+    for p, m in {86: 0x93, 87: 0x94, 88: 0x95, 89: 0x96, 90: 0x92, 91: 0x91, 92: 0x90}.items():
+        fn2[p] = (m, 0, 0, 0)
+    fn2[53] = (0xFB, 0x00, 0, 0)                        # Fn2+[ = LED mode cycle
+    fn2[54] = (0xFB, 0x0E, 0, 0)                        # Fn2+] = LED switch
+    for p, vk in {116: 0xFB, 117: 0x25, 119: 0x27, 97: 0x26, 118: 0x28}.items():
+        fn2[p] = _rec_key(vk)
+    return {"base": base, "fn1": fn1, "fn2": fn2, "tap": [None] * 126}
+
+
+def _parse_target(spec):
+    s = spec.strip().lower()
+    if s in ("none", "clear", "transparent"):
+        return None
+    if s in ("disable", "off"):
+        return (0xBF, 0, 0, 0)
+    if s == "fn":
+        return (0xFF, 0, 0, 0)
+    if s == "fn2":
+        return (0xFE, 0, 0, 0)
+    if s in MEDIA:
+        return (MEDIA[s], 0, 0, 0)
+    if s in MOUSE:
+        return (MOUSE[s], 0, 0, 0)
+    if s in SPECIAL:
+        return (0xFB, SPECIAL[s], 0, 0)
+    if s in TARGET_HID:                     # whole name first, so "kp+" isn't split
+        return (0xFC, 0, TARGET_HID[s], 0x00)
+    # split combos on "+", re-attaching a "+" that belongs to a key name (kp+, ctrl+kp+)
+    parts = []
+    for tok in s.split("+"):
+        if tok == "" and parts:
+            parts[-1] += "+"
+        else:
+            parts.append(tok)
+    mods, keys = 0, []
+    for part in parts:
+        part = MOD_ALIASES.get(part, part)
+        if part in MOD_BITS:
+            mods |= MOD_BITS[part]
+        elif part in TARGET_HID:
+            keys.append(TARGET_HID[part])
+        else:
+            sys.exit(f"Unknown target '{part}'. Use key names (a, f5, esc, left...), modifiers "
+                     f"(ctrl, shift, alt, cmd, rctrl...), combos like ctrl+c, media "
+                     f"({', '.join(MEDIA)}), mouse ({', '.join(MOUSE)}), "
+                     f"lighting/special ({', '.join(SPECIAL)}), fn, fn2, disable, none")
+    if len(keys) > 2:
+        sys.exit("At most two non-modifier keys in one combo")
+    if not keys:
+        if not mods:
+            sys.exit("Empty target")
+        # modifier-only key, same shape as OemDrv's own encoding
+        return (0xFC, mods, 0xE3 if mods == 0x08 else 0x00, 0x00)
+    keys += [0] * (2 - len(keys))
+    return (0xFC, mods, keys[0], keys[1])
+
+
+def _describe(rec):
+    if rec is None:
+        return "-"
+    c0, c1, c2, c3 = rec
+    if c0 == 0xFF:
+        return "Fn"
+    if c0 == 0xFE:
+        return "Fn2"
+    if c0 == 0xBF:
+        return "disabled"
+    if c0 == 0xFB:
+        return next((k for k, v in SPECIAL.items() if v == c1), f"special {c1:#x}")
+    if c0 == 0xFC:
+        names = [k for k, b in MOD_BITS.items() if c1 & b]
+        names += [HID_NAME.get(u, f"0x{u:02x}") for u in (c2, c3) if u and u != 0xE3]
+        return "+".join(names) or "none"
+    for d in (MEDIA, MOUSE):
+        n = next((k for k, v in d.items() if v == c0), None)
+        if n:
+            return n
+    return " ".join(f"{x:02x}" for x in rec)
+
+
+def _load_layers():
+    s = _read_state_file()
+    if "layers" in s:
+        return {k: [tuple(r) if r else None for r in v] for k, v in s["layers"].items()}, True
+    return _default_layers(), False
+
+
+def _layer_packets(layer, recs):
+    block = bytearray(756)
+    for idx, r in enumerate(recs):
+        if r:
+            block[idx * 6:idx * 6 + 6] = bytes([idx, *r, 0])
+    for pkt in range(1, 15):
+        chunk = bytes(block[(pkt - 1) * 54:pkt * 54])
+        yield bytes([0xA0, 0x02, 0x04, pkt, 0x0E, LAYER_IDS[layer]]) + chunk + bytes([0xA5])
+
+
+def _send_layer(layer, recs, dry_run=False, verbose=False):
+    pk = list(_layer_packets(layer, recs))
+    if dry_run:
+        nz = [i for i, r in enumerate(recs) if r]
+        print(f"would send layer {layer} (ID {LAYER_IDS[layer]}): 14 packets, "
+              f"{len(nz)} keys set")
+        for p in pk[:2]:
+            print("  ", hexs(bytes([REPORT_ID]) + p)[:110], "...")
+        return True
+    import time
+    kb = Keyboard()
+    try:
+        kb.handshake(verbose=verbose)
+        time.sleep(0.03)
+        for p in pk:
+            if not kb.send(p, verbose=verbose):
+                print(f"No acknowledgement for packet {p[3]} - stopping. Fn2+Esc restores defaults.")
+                return False
+    finally:
+        kb.close()
+    return True
+
+
+def cmd_map_show(a):
+    layers, known = _load_layers()
+    if not known:
+        print("(nothing written by this tool yet - showing the factory keymap from Dev.ini)")
+    names = [a.layer] if a.layer else list(LAYER_IDS)
+    for L in names:
+        recs = layers[L]
+        print(f"\n[{L}]" + ("  (unset keys fall through to base)" if L != "base" else ""))
+        rows = [(KEY_AT.get(p, f"pos{p}"), _describe(r)) for p, r in enumerate(recs)
+                if r and (L != "base" or a.all or r != _default_layers()["base"][p])]
+        if L == "base" and not a.all:
+            print("  (only keys that differ from factory; --all to list every key)")
+        for k, d in rows:
+            print(f"  {k:<7} -> {d}")
+        if not rows:
+            print("  (none)")
+
+
+def cmd_map_set(a):
+    layers, known = _load_layers()
+    keys = _parse_keys(a.key)
+    if not keys:
+        sys.exit("--key needs one or more key names")
+    if a.layer == "base" and not a.yes:
+        sys.exit("Changing the base layer can make keys stop working until Fn2+Esc. "
+                 "Try it on fn2 first; add --yes to proceed.")
+    specs = _split_list(a.to)
+    if len(specs) == 1:
+        specs *= len(keys)                         # one target for every listed key
+    elif len(specs) != len(keys):
+        sys.exit(f"{len(keys)} keys but {len(specs)} targets: give one target for all, "
+                 "or exactly one per key (paired in order)")
+    factory = _default_layers()[a.layer]
+    # "default" = this key's factory setting on this layer (for fn/tap: usually unset)
+    targets = [factory[p] if s.strip().lower() in ("default", "factory") else _parse_target(s)
+               for p, s in zip(keys, specs)]
+    for p, rec in zip(keys, targets):
+        if a.layer == "base" and p in (115, 116):
+            sys.exit("Refusing to remap Fn/Fn2 on the base layer (you'd lose the Fn2+Esc reset).")
+    for p, rec in zip(keys, targets):
+        layers[a.layer][p] = rec
+        print(f"{a.layer}: {KEY_AT[p]} -> {_describe(rec)}")
+    if _send_layer(a.layer, layers[a.layer], a.dry_run, a.verbose) and not a.dry_run:
+        _save_state({"layers": {k: [list(r) if r else None for r in v] for k, v in layers.items()}})
+        print("OK - written and saved.")
+
+
+def cmd_map_reset(a):
+    layers, _ = _load_layers()
+    d = _default_layers()
+    names = list(LAYER_IDS) if a.layer == "all" else [a.layer]
+    for L in names:
+        layers[L] = d[L]
+        print(f"restoring factory {L} layer")
+        if not _send_layer(L, layers[L], a.dry_run, a.verbose):
+            return
+    if not a.dry_run:
+        _save_state({"layers": {k: [list(r) if r else None for r in v] for k, v in layers.items()}})
+        print("OK")
+
+
 def cmd_modes(a):
     print("mode  speed  brightness  color")
     for o in LED_OPTS:
@@ -565,10 +838,105 @@ def _load_state():
         return {k: [FACTORY[k]] * 126 for k in TABLES}, False
 
 
-def _save_state(state):
+def _read_state_file():
     import json
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(state):
+    """Merge `state` (any top-level keys) into the state file, keeping other sections."""
+    import json
+    s = _read_state_file()
+    s.update(state)
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+        json.dump(s, f, indent=1)
+
+
+# ---------------------------------------------------------------- keyboard options (B5)
+# protocol.md 8.1: B5 <tapOn> <tapTime/10ms> <debounceCnt> <debounceTime> <magicFN> <capsLED> 00 01
+# All six are sent every time. Defaults below are exactly what the official app sends for this
+# model (tap/debounce/MagicFN pages are hidden for the Master 65%, so it always sends these).
+OPT_DEFAULTS = {"tap": 1, "tap_time": 30, "debounce": 2, "debounce_time": 2, "magic_fn": 0,
+                "caps_led": 0}
+
+
+def _options_payload(o):
+    return bytes([0xB5, o["tap"], o["tap_time"], o["debounce"], o["debounce_time"],
+                  o["magic_fn"], o["caps_led"], 0x00, 0x01])
+
+
+def cmd_options(a):
+    s = _read_state_file()
+    o = dict(OPT_DEFAULTS, **s.get("options", {}))
+    known = "options" in s
+    onoff = {"on": 1, "off": 0}
+    changed = False
+    if a.caps_led is not None:
+        o["caps_led"] = onoff[a.caps_led]; changed = True
+    if a.tap is not None:
+        o["tap"] = onoff[a.tap]; changed = True
+    if a.tap_time is not None:
+        if not 0 <= a.tap_time <= 1000 or a.tap_time % 10:
+            sys.exit("--tap-time must be 0..1000 ms in steps of 10")
+        o["tap_time"] = a.tap_time // 10; changed = True
+    if a.debounce is not None:
+        if not 0 <= a.debounce <= 5:
+            sys.exit("--debounce must be 0..5")
+        o["debounce"] = a.debounce; changed = True
+    if a.magic_fn is not None:
+        o["magic_fn"] = a.magic_fn; changed = True
+    if a.app_defaults:
+        o = dict(OPT_DEFAULTS); changed = True
+
+    def show():
+        print(f"  Caps Lock LED : {'on' if o['caps_led'] else 'off'}")
+        print(f"  tap           : {'on' if o['tap'] else 'off'}, {o['tap_time']*10} ms  (hidden for this model)")
+        print(f"  debounce      : {o['debounce']}  (hidden for this model; likely mechanical boards only)")
+        print(f"  Magic Fn mode : {o['magic_fn']}  (hidden for this model)")
+    if not changed:
+        print("Options last written by this tool:" if known else
+              "(nothing written by this tool yet - showing the official app's defaults)")
+        show()
+        return
+    for k, label in (("tap", "tap"), ("tap_time", "tap time"), ("debounce", "debounce"),
+                     ("magic_fn", "Magic Fn")):
+        if o[k] != OPT_DEFAULTS[k]:
+            print(f"note: {label} differs from what the official app sends for this model; "
+                  "its effect on this keyboard is unknown (Fn2+Esc undoes it)")
+    payload = _options_payload(o)
+    print("Sending:")
+    show()
+    if a.dry_run:
+        print("would send:", hexs(bytes([REPORT_ID]) + payload), "+ zero padding")
+        return
+    kb = Keyboard()
+    try:
+        kb.handshake(verbose=a.verbose)
+        r = kb.send(payload, verbose=a.verbose)
+    finally:
+        kb.close()
+    if r:
+        _save_state({"options": o})
+        print("OK - keyboard acknowledged.")
+    else:
+        print("No acknowledgement; nothing saved.")
+
+
+def _split_list(spec):
+    """Split on "," but keep the comma key itself: "," / "a,,,b" / ",,a" / "a,," """
+    toks, names, i = spec.split(","), [], 0
+    while i < len(toks):
+        if toks[i] == "":
+            names.append(",")
+            i += 2 if i + 1 < len(toks) and toks[i + 1] == "" else 1
+        else:
+            names.append(toks[i])
+            i += 1
+    return names
 
 
 def _parse_keys(spec):
@@ -576,7 +944,7 @@ def _parse_keys(spec):
         return None  # all positions
     by_name = {v.lower(): p for p, v in KEY_AT.items()}
     out = []
-    for raw in spec.split(","):
+    for raw in _split_list(spec):
         n = raw.strip()
         n = ALIASES.get(n.lower(), n).lower()
         if n not in by_name:
@@ -770,6 +1138,35 @@ def main():
     rt.add_argument("--key", required=True)
     rt.add_argument("--seconds", type=float, default=60)
     rt.set_defaults(fn=cmd_rt_test)
+
+    mp = sub.add_parser("map", help="key remapping per layer (base, fn1, fn2, tap)")
+    ms = mp.add_subparsers(dest="mcmd", required=True)
+    m1 = ms.add_parser("show")
+    m1.add_argument("--layer", choices=list(LAYER_IDS))
+    m1.add_argument("--all", action="store_true", help="list every base-layer key")
+    m1.set_defaults(fn=cmd_map_show)
+    m2 = ms.add_parser("set", help="e.g. --layer tap --key RShift --to up")
+    m2.add_argument("--layer", required=True, choices=list(LAYER_IDS))
+    m2.add_argument("--key", required=True, help="key(s) to change, comma list")
+    m2.add_argument("--to", required=True, help="key, combo (ctrl+c), media, mouse, special, "
+                                                "fn, fn2, disable, none (unset), default (factory)")
+    m2.add_argument("--yes", action="store_true", help="required for the base layer")
+    m2.add_argument("--dry-run", action="store_true")
+    m2.set_defaults(fn=cmd_map_set)
+    m3 = ms.add_parser("reset", help="send the factory keymap for a layer")
+    m3.add_argument("--layer", required=True, choices=list(LAYER_IDS) + ["all"])
+    m3.add_argument("--dry-run", action="store_true")
+    m3.set_defaults(fn=cmd_map_reset)
+
+    op = sub.add_parser("options", help="Caps Lock LED, tap, debounce, Magic Fn (no args = show)")
+    op.add_argument("--caps-led", choices=["on", "off"])
+    op.add_argument("--tap", choices=["on", "off"], help="advanced; hidden for this model")
+    op.add_argument("--tap-time", type=int, help="ms, 0-1000 step 10; advanced")
+    op.add_argument("--debounce", type=int, help="0-5; advanced, likely mechanical only")
+    op.add_argument("--magic-fn", type=int, choices=[0, 1, 2], help="advanced")
+    op.add_argument("--app-defaults", action="store_true", help="send the official app's values")
+    op.add_argument("--dry-run", action="store_true")
+    op.set_defaults(fn=cmd_options)
 
     tg = sub.add_parser("trigger", help="actuation / rapid-trigger settings")
     ts = tg.add_subparsers(dest="tcmd", required=True)
