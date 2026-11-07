@@ -201,6 +201,18 @@ After **Fn2+Esc**, run `python ranked.py trigger reset` and `python ranked.py ma
 - **Numpad keys** don't act as arrows on macOS: there's no Num Lock behaviour there.
 - **The official app writes `\` settings to the wrong key position** (75 instead of 55). This
   tool uses the correct one.
+- **Tap mode / layers:** the official app sends tap keys to layer slot 5, which this firmware
+  ignores. The real tap layer is slot 4 (`map set --layer slot4`, experimental), active only
+  while `options --tap on`. On the Master 65% it's buggy: the slot-4 key replaces the base key,
+  fires on release and stays pressed until the next key, and holding never produces the base key.
+- **Second actuation point** (`trigger second`, experimental): accepted, but has no effect.
+- **Options read-back:** the handshake reply reports the current options (Caps LED, tap,
+  debounce, Magic Fn), so `options` and the web app read them from the keyboard. Factory values:
+  tap off (130 ms), debounce 0, Magic Fn 0, Caps LED on.
+- **Music mode** (web app): the keyboard accepts a live per-key colour stream (`B1`, 126 × RGB,
+  7 packets/frame, ~25 fps). Nothing is stored on the keyboard; stopping the stream ends it.
+- **Firmware updates** are encrypted on the PC and decrypted by the keyboard's bootloader, so
+  firmware can't be read or modified from the computer.
 
 ## Protocol
 

@@ -104,6 +104,14 @@
 
   // ------------------------------------------------------------- options
   const OPT_DEFAULTS = { tap: 1, tap_time: 30, debounce: 2, debounce_time: 2, magic_fn: 0, caps_led: 0 };
+  // keyboard's own factory values (read back from a freshly reset Master 65%)
+  const OPT_FACTORY = { tap: 0, tap_time: 13, debounce: 0, debounce_time: 1, magic_fn: 0, caps_led: 1 };
+  const OPT_FIELDS = ["tap", "tap_time", "debounce", "debounce_time", "magic_fn", "caps_led"];
+  // the GetPSD reply (report ID stripped) carries the current options at bytes 9..14, then 00 01
+  function optionsFromReply(d) {
+    if (!d || d.length < 17 || d[15] !== 0 || d[16] !== 1) return null;
+    return Object.fromEntries(OPT_FIELDS.map((k, i) => [k, d[9 + i]]));
+  }
   const optionsPayload = (o) => [0xB5, o.tap, o.tap_time, o.debounce, o.debounce_time, o.magic_fn, o.caps_led, 0x00, 0x01];
 
   // ------------------------------------------------------------- keymap
@@ -318,12 +326,23 @@
     return chunks.map((c, k) => [0xA8, id, 0x00, k + 1, chunks.length, c.length, ...c]);
   }
 
+  // ------------------------------------------------------------- live per-key stream ("music mode")
+  // protocol.md 10.2: frame = 126 keys x [R,G,B] (378 bytes), sent as 7 packets
+  //   B1 00 00 <pkt 0..6> <57 bytes>, no reply. Stop = stop sending.
+  function streamPackets(frame) {
+    if (frame.length !== 378) err("stream frame must be 378 bytes");
+    const out = [];
+    for (let pkt = 0; pkt < 7; pkt++) out.push([0xB1, 0x00, 0x00, pkt, ...frame.slice(pkt * 57, pkt * 57 + 57)]);
+    return out;
+  }
+
   // ------------------------------------------------------------- safety
   // the only payloads that may ever be sent (bootloader A5, resets A0 02 03 / AE 06 never pass)
   function allowed(p) {
     const eq = (a, b) => a.length >= b.length && b.every((x, i) => a[i] === x);
     if (p.length > 63) return false;
     if (eq(p, GET_PSD) && p.length === 4) return true;
+    if (p[0] === 0xB1 && p[1] === 0 && p[2] === 0 && p[3] <= 6 && p.length <= 61) return true;
     if (p[0] === 0xAE && p[1] === 0x01) return true;
     if (p[0] === 0xB6 && [0x01, 0x03, 0x04, 0x05].includes(p[1])) return true;
     if (p[0] === 0xB5 && p.length === 9 && p[7] === 0 && p[8] === 1) return true;
@@ -337,9 +356,9 @@
   const api = { VID, PID, USAGE_PAGE, REPORT_ID, EXPECTED_PSD, GET_PSD, KEYS, KEY_AT, POSITIONS,
     splitList, parseKeys, LED_OPTS, EFFECT_COLORS, MAX_LEVEL, ledPayload, RGB_MODE, RGB_NAMES,
     rgbPackets, GAOSHOU, vkToPos, TABLES, FACTORY, LIMITS, triggerPackets, OPT_DEFAULTS,
-    optionsPayload, LAYER_IDS, TARGET_HID, MOD_BITS, MEDIA, MOUSE, SPECIAL, defaultLayers, parseTarget,
+    optionsPayload, OPT_FACTORY, OPT_FIELDS, optionsFromReply, LAYER_IDS, TARGET_HID, MOD_BITS, MEDIA, MOUSE, SPECIAL, defaultLayers, parseTarget,
     describe, sameRec, layerPackets, macroRefs, MACRO_MAX, MACRO_MEMORY, MOD_USAGE, compileMacro,
-    macroAlloc, macroDataPackets, allowed, tokenize };
+    macroAlloc, macroDataPackets, streamPackets, allowed, tokenize };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.RankedCore = api;
 })(typeof window !== "undefined" ? window : globalThis);

@@ -469,3 +469,266 @@ The observed behaviour (first press registers at actuation + press-sensitivity) 
 * Allocation stops with "!!!!Macro buffer too small" when the running offset reaches it (`0x46c385`).
 * There is no separate slot-count limit; the ID is one byte. Only macros actually bound to keys are uploaded.
 * The device-side cost per macro is size+5 (A7 argument).
+
+---
+
+## 9. Firmware update path in `UsbHid_v1.0.6.dll`
+
+Static analysis only. Nothing was run and nothing was sent to any device.
+Target: `UsbHid_v1.0.6.dll` (PE32 x86, MFC, image base 0x10000000), SHA-256 `014d6ef84dc138ea3656fa092ef33e331b5695095fb34fb687f107f42522bb7d`.
+PDB path: `E:\project\pc_sdk_tool\Online_Update_tool\Ry_Online_Update_Dll_ouput_v1.0.6_UsbHid_lib_src\...\UsbHid_v1.0.6.pdb` (`0x101b006c`).
+Method: Hopper via REA, plus `objdump -d` for exact stack offsets. Addresses are DLL VAs.
+
+### 9.1 Exports and global state
+
+| Export | Address | Behaviour |
+|---|---|---|
+| `userSetCfgFilePath(path, ...)` | `0x10005d80` | Stores the update directory. `update_config.ini` is resolved relative to it |
+| `chipGoToBootFirmware(cb)` | `0x10005b50` | Stores the callback. Runs `0x10004040` (send "go to boot" to the **app** device, §9.4), then `0x10004830` (wait for the boot device, optionally running `BootTriger.exe`). **OemDrv imports this but never calls it.** OemDrv uses its own `A5 01` command instead (§5) |
+| `appUpdateFirmware(cb)` | `0x10005be0` | Reads `[PRODUCT] program_type`, which must equal `"USB"` (`0x10005cbf`). Calls `0x10003360` (find device + `getv`, §9.4). The board ID must satisfy `(id & 0xF000) == 0xA000`. Then `Sleep(1000)` and runs the flash routine **`0x10004e40`** |
+
+* Progress callback: `cb(&state /*0x101c3794*/, &percent /*0x101cd5f0*/)` (`0x10002950`). States 1..5 = open, start, data, finish, done.
+* Handles: write handle `0x101c3790` and read handle `0x101c379c` are the same `CreateFileA(path, GENERIC_RW, share 3, OPEN_EXISTING, FILE_FLAG_OVERLAPPED)` (`0x10002ae0`).
+* Device lookup: `SetupDiGetClassDevsA(HidGuid, 0, 0, 0x12)` + `StrStr` on the interface path (`0x10002b20`).
+* The DLL imports only `HidD_GetHidGuid` from HID.DLL. There is no `HidD_SetFeature`/`SetOutputReport`. All I/O is **WriteFile/ReadFile of 65-byte reports**.
+
+### 9.2 How the `.enc` file is read and what `encryption_en=1` changes (Q A1)
+
+All keys are read with `GetPrivateProfileStringA` from `update_config.ini`.
+
+| Key (section) | Use | Evidence |
+|---|---|---|
+| `bootdev_info` (`BOOTDEVICE_INFO`) | Path substring of the bootloader HID device, e.g. `vid_352d&pid_1101` → global `0x101cd620` | `0x100040f1`, `0x1000489c` |
+| `appdev_info` (`APPDEVICE_INFO`) | Path substring of the application-mode device (`vid_1928&pid_0078` in the shipped configs) → `0x101cd61c`. Used only by `chipGoToBootFirmware` and as a `getv` fallback | `0x100042fd` |
+| `program_type` (`PRODUCT`) | Must be `USB` | `0x10005c2f`/`0x10005cbf` |
+| `encryption_en` (`ENCRY_EN`) | **Only selects which file extension is accepted.** If the key is missing or ≠0, `upgrade_file` must end in **`.enc`** (`0x100051f7`). If it is 0, the file must end in **`.bin`** (`0x10005324`). On mismatch → error 1. **Nothing else in the code depends on this flag**: the same read/send path runs either way | `0x10005163`–`0x10005381` |
+| `upgrade_file` (`BIN_FILE`) | File name. Also parsed for metadata (below) | `0x10004f89`, `0x100055c0` |
+| `time_out` (`WAIT_TIME_OUT`) | Seconds to wait for the boot device after go-to-boot. Clamped to 3..100, default 30 (`0x100045e9`–`0x10004600`) | `0x10004a59` |
+| `ext_boot_triger` (`EXTERNAL_BOOT_TRIGER`) | Optional `BootTriger.exe`, launched with **`WinExec`** (`0x10004c39`) in the chipGoToBootFirmware path only | `0x10004b83` |
+| `[USB_VER] BCD` | **Not read.** There is no `USB_VER`/`BCD` string in the DLL | — |
+
+**Metadata from the file name.** `usb_hid_app_v1.0.4_BF5C554E.enc` is parsed as follows:
+* `Right(19)` → `v1.0.4_BF5C554E.enc` → `Left(6)` = `v1.0.4`. `v`/`.` are stripped and the rest is parsed with `"%04x"` → **file version** in `0x101cd5f8` (e.g. `0x104`) [inf on the exact strip; `0x1000538e`–`0x10005599`].
+* `Right(12)` → `Left(8)` = `BF5C554E`, parsed with `"%08x"` → **expected checksum** in `0x101cd608` (`0x1000561f`–`0x100056e6`).
+
+**File read sequence** (`0x10004e40`, CRT `fopen(...,"rb")` @ `0x100056fd`, `fread` = `0x101466af`):
+1. `fseek(0)`, then read the whole file in 0x200-byte chunks. Compute **`x = XOR of all little-endian u32 words`** (`0x10005745`–`0x1000577c`). It must equal the file-name checksum, otherwise error 8 (`0x10005794`).
+   * Verified offline on all 15 shipped `.enc` files: the XOR matches the name in every case (e.g. A0A5 → `BF5C554E`, RD68 A0C1 → `65F23F87`).
+2. `fseek(SEEK_END)`. `image_size = filesize − 0x20` (`0x100057cc`). The first **0x20 bytes are a header**; the rest is the image body.
+3. `fseek(0)`. During flashing: `fread(0x20)` → header into the START frame. Then repeated `fread(0x200)` → DATA frames until EOF.
+
+### 9.3 Is anything decrypted? (Q A2)
+
+**No. The bytes sent to the bootloader are the file bytes, verbatim.**
+* Every `fread` goes straight into the outgoing frame buffer (`-0x434(%ebp)`/`-0x42c(%ebp)`) and is passed to the sender `0x10004d20` without modification (`0x10005885`, `0x10005920`).
+* The only arithmetic on file data is the 32-bit XOR checksum (`0x10005750`, `0x10005950`).
+* **No crypto constants exist in the DLL.** A full-file scan found no AES S-box (`63 7c 77 7b…`), inverse S-box, T-tables, Rcon, CRC32/CRC16 tables, MD5/SHA-256 constants, TEA delta or SM4 S-box. There is no CryptoAPI/BCrypt import.
+* **No key is present or derived.** Decryption, if any, happens **inside the bootloader**.
+
+Evidence that the body is block-encrypted on the PC side:
+* `(filesize − 0x20)` is a multiple of 16 in every file.
+* Each body contains **one 16-byte ciphertext block repeated 2416 times** (1814 in the RD68 file). This is the ECB signature of a constant plaintext such as `0xFF` padding.
+* The repeated block differs between files of the same firmware version. This suggests a per-board key or a key carried in the 32-byte header [inf].
+
+The cipher is consistent with 128-bit-block ECB (e.g. AES-ECB) [inf]. The DLL does not reveal the algorithm or the key.
+
+**One exception: a code stub is sent in clear.** For board IDs **`0xA105`, `0xA106`, `0xA107`** only (`0x100032f0`), the START frame also carries 0x1C0 bytes built from a **0x1B8-byte constant at `0x101a6b40`**, laid out as `[u32 0x1B8][0x1B8 bytes][u32 XOR of those bytes]`.
+* The bytes are Thumb-2 code, with a literal pool containing `0x40013000`, `1000000`, `0x34BC0`, `0x15F900`. This looks like a RAM flash-algorithm or clock-setup stub [inf].
+* None of the shipped boards (A0A1…A0C1) uses it.
+
+### 9.4 Bootloader protocol (device `vid_352d&pid_1101`) (Q A3)
+
+**Transport** (`0x10002d20` write, `0x10002e50` read):
+* Every report is **65 bytes: `00` (report ID 0) + 64 bytes**.
+* Writes and reads are overlapped, each with a 3000 ms `WaitForSingleObject` (`0xbb8`).
+* A logical **frame** is chopped into ⌈len/64⌉ consecutive 64-byte reports. The last one is zero-padded (`0x10004d4c`–`0x10004da7`).
+* After the last report, **one 64-byte reply** is read (report ID stripped).
+* The whole frame is retried up to **3×** if no reply arrives (`0x10004dc2`).
+
+**Frame layout** (built at `ebp-0x43c` in `0x10004e40`):
+```
+off  size  field
++0   u8    cmd            01=START 02=DATA 03=FINISH  (00 = query / go-to-boot, §below)
++1   u8    seq            starts at 0, +1 after every successful frame (START=0, DATA=1..N, FINISH=N+1; wraps at 8 bits)
++2   u16   word_count     image_size/4 (body only); set in START and FINISH, left unchanged in DATA
++4   u16   data_len       number of bytes from +8
++6   u8    flag           1 in START (0x10005878); stays 1 afterwards
++7   u8    (not written)  [?] stack residue, believed 0
++8   ...   data
+total on wire = data_len + 8, little-endian
+```
+
+**Reply check** (`0x10004e01`): `reply[0] == cmd` **and `reply[8] == 0x04`** → success. Any other value → error 3. No reply after 3 tries → error 2.
+
+| Step | State | Frame | Data | Evidence |
+|---|---|---|---|---|
+| Open | 1 | — | `CreateFileA` on the boot device path | `0x10005805` |
+| **START** | 2 | `01 00 <size/4> <0x28 or 0x1E8> 01 ?` | `+8 u32 image_size` (filesize−0x20) · `+0xC u32 file_version` (from the name) · `+0x10 [32]` **file header bytes 0..0x1F** · (+0x30 [0x1C0] stub, A105–A107 only) | `0x1000583d`–`0x100058d1` |
+| **DATA** ×N | 3 | `02 <seq> <size/4> 0200 01 ?` | 0x200 file bytes. The last block is short (`data_len` = bytes read). A 0x208-byte frame = **9 reports** (8×64 + 8) | `0x1000590c`–`0x1000597d` |
+| **FINISH** | 4 | `03 <seq> <size/4> 000C 01 ?` | `+8 u32` **XOR of all body words** (header excluded) · `+0xC u8 day, +0xD u8 month, +0xE u16 year, +0x10 u8 second, +0x11 u8 minute, +0x12 u16 hour` from `GetLocalTime` | `0x10005a05`–`0x10005a93` |
+| Close | 5 | — | `CloseHandle`, callback with 100% | `0x10005af3`–`0x10005b19` |
+
+* **Block size** 512 bytes. A 0x1CC00-byte body (RD61) = 230 DATA frames.
+* Progress = `min(100, blocks·51200 / image_size)` (`0x1000598a`–`0x100059b0`).
+* **No explicit erase, verify-readback or reboot command.**
+  * Erase is presumably implied by START (it carries the total size).
+  * Verification is the device-side check of the FINISH XOR and word count.
+  * The DLL sends nothing after FINISH, so reboot into the application is up to the bootloader [inf].
+* **No CRC.** The only integrity values are the 32-bit XOR checksums: whole file (checked locally) and body (sent in FINISH).
+
+**Cmd 0 frames** (`seq 0`, outside the flash state machine):
+
+| Purpose | Frame (len) | Expected reply | Evidence |
+|---|---|---|---|
+| **`getv` query** (`0x10003360`, called by `appUpdateFirmware`). Sent to the boot device if present, otherwise to the app device | `00 00 0000 0004 00 ?` + ASCII **`"getv"`** (12 bytes) | `r[0]==0`, `u16 r[4]==0x10`. **Board ID = `r[0x10]<<8 \| r[0x11]`** → `0x101cd600` (e.g. `0xA0A5`). **Version = `r[0x14]<<8 \| r[0x15]`** → `0x101cd5fc` | `0x10003ecb`–`0x10003f8c` |
+| **go-to-boot** (`0x10004040`, chipGoToBootFirmware only). Sent to the **app device** | `00 00 0000 0010 00 ?` + `01 55 AA FF 01 55 AA FF 01 55 AA FF 01 55 AA 00` (24 bytes) | `r[0]==0`, `r[8]==4`, `u16 r[4]==1`. Then the DLL polls for the boot device once per second until `time_out` | `0x100040a5`–`0x100040d5`, `0x100046a8`–`0x10004752` |
+
+* The **update folder names (`A0A1`, `A0A5`, `A0C1`, …) equal the board ID returned by `getv`**, and they are also the keyboard PIDs in `Dev.ini` (`PID=A0A2,…`). OemDrv therefore picks `Update\<PID>\` [inf].
+
+### 9.5 MCU / vendor strings (Q A4)
+
+* **No string names the MCU or chip vendor.** Searched both binaries (ASCII and UTF-16) and all `Dev.ini` / `update_config.ini` files for STM32, GD32, CH5xx/WCH, Sinowealth, Sonix, Holtek, Nordic, Telink, Beken, PY32/Puya, Nuvoton, Cypress, NXP and "chip". The only hits are MFC/locale noise.
+* Indirect clues:
+  * The PDB prefix `Ry_Online_Update` and the `RY_*` resource names point to the tool vendor, not the silicon.
+  * The bootloader VID is `0x352D`, the app VID in the update config is `0x1928` (OemDrv profiles use `0x3532`).
+  * The A105–A107 stub is ARM Thumb code that touches peripheral base `0x40013000` [inf: Cortex-M class].
+
+---
+
+## 10. Music / audio-reactive lighting (OemDrv.exe)
+
+All addresses are OemDrv VAs.
+
+### 10.1 Audio capture and call chain (Q B1)
+
+* **Capture is WASAPI shared-mode loopback of the default render endpoint.** No waveIn or mixer API is used.
+  * Thread entry `0x463e10` → `RecordAudioStream` **`0x462ea0`** (log `0x5d8a08`).
+  * Calls: `CoCreateInstance(MMDeviceEnumerator)` → `GetDefaultAudioEndpoint` → `Activate(IAudioClient)` and `IAudioEndpointVolume` → `GetMixFormat` (forced to PCM, `0x4630a9`–`0x4631a8`) → **`IAudioClient::Initialize(SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK = 0x20000, …)`** (`0x4631c6`) → `GetService(IAudioCaptureClient)`.
+  * It is paced by a waitable timer (`CreateWaitableTimerW`/`SetWaitableTimer`) at the device period. It reads with `GetNextPacketSize`/`GetBuffer`.
+  * It restarts on default-device change ("Audio device changed, Re StartRec", `0x462e05`).
+* **Analysis**:
+  * Samples are converted to float (`0x463a10`, 8/16-bit, 1/2/6/8 channels). A power-of-two FFT runs (`FFT::Compute` `0x463844`; N in `obj+0x2a8`).
+  * 23 bands are produced at fixed frequencies (table **`0x5d4c88`**): **30, 60, 100, 160, 240, 300, 350, 400, 440, 500, 600, 800, 1000, 1500, 2000, 2600, 3000, 4000, 6000, 8000, 10000, 14000, 16000 Hz** (`0x46391d`–`0x4639b6`).
+  * Band value = `(int)(20·log(P[bin] / full_scale²))`, with full_scale² = 127² or 32767². The bin is `N·f/rate`. Bands above Nyquist are 0 [inf on the log base; the call is `0x58b990`].
+  * The callback `[obj+8](bands, 23, ctx)` (`0x4639ea`) is registered at `0x442674` as **`0x441f70` → `0x441e20`**. It multiplies by the **gain** `float[0x616450 + 4·gainIdx]` (`gainIdx = [0x6259ec]`, the "Gain factor" UI), clamps to **0..100**, and averages over the last **`[0x6259f0]`** frames ("Smoothness", default 4). The result goes into `mainwnd+0x958` (23 × int32), guarded by the lock at `+0x950`.
+* **Who calls SendMusicData.** The lighting-effect thread **`0x466030`** has exactly one call, via device vtable `+0x24` at **`0x466b58`**: `SendMusicData(frame, 0x17A)`. There is no other caller [obs].
+
+### 10.2 B1 packet contents (Q B2)
+
+**Frame = 378 bytes = 126 keys × 3 bytes**, built at `esp+0x4e4` in `0x466030` (cleared every tick with `memset(…, 0, 0x400)` at `0x4668c2`).
+* `frame[3·k + 0] = R`, `frame[3·k + 1] = G`, `frame[3·k + 2] = B` for key index **k**. k is the same key index as in B6/B7 and SetMatrix (key-table entry byte +8; `0x466a96`–`0x466abd`).
+* The colour is a Win32 `COLORREF` (`0x00BBGGRR`), stored low byte first. The order is therefore R,G,B [inf from the COLORREF palette at `0x466151`: `0x0000FF`, `0xFF00FF`, `0x00FFFF`, …].
+* Each byte is 0..255. Dimmed segments are scaled per channel (`0x466a46`–`0x466a94`). Unlit keys are `00 00 00`.
+* **These are per-key colours, not spectrum bars.** The spectrum is turned into key colours on the PC.
+
+**Packetisation** (`0x46b800`, async, **no reply read**: `SendNoReply`):
+```
+payload: B1 00 00 <pkt> <57 data bytes>          (wire: 04 B1 00 00 <pkt> …)
+pkt = 0,1,2,…,6 ; data = frame[57·pkt … ] ; 378 = 6×57 + 36 → 7 packets / frame
+```
+* `Sleep(3)` follows each packet. There is no count or end marker; the firmware must infer frame completion from pkt 6 or from the data length [inf].
+* A frame is dropped if `dev+0x14 != 0` (the same busy flag as AskTrigger, `0x46b878`).
+
+**Frame rate.** The effect loop runs `Sleep(20)` per iteration (`0x466256`), then sends 7 packets with `Sleep(3)` each. That gives ≈ 40–45 ms per frame, **≈ 22–25 fps** [inf: excludes WriteFile latency].
+* Silence throttling: when all 23 bands are 0 for more than 100 consecutive ticks, only every 41st tick is rendered (`0x4665e0`–`0x466611`).
+
+### 10.3 `ET\<n>\audiobar.txt` and `stream_h.txt` (Q B3)
+
+**Folder choice** (`0x4666e0`–`0x466755`):
+* First `<device dir>\ET` if it exists (`PathFileExists`).
+* Otherwise `<app dir>ET\<n>`, with `n = [gVar+0x47a4]`, forced to 1 if ≤ 0.
+* **No writer of `gVar+0x47a4` was found** (no Dev.ini key stores to it), and no shipped device folder has an `ET` subfolder. So this build effectively always uses **`ET\1`** [obs on the reads, ? on the writer].
+* Files are reloaded only when effect, colour mode or colour change (`0x466632`–`0x466666`).
+
+**The 10 ET folders are keyboard-layout variants, not 10 effects.** Each contains the same two map files for a different physical layout:
+
+| ET | bars (audiobar lines) | stream columns | keys | layout [inf] |
+|---|---|---|---|---|
+| 1 | 15 | 20 | 105 | full-size with numpad |
+| 2, 3, 4 | 9 / 9 / 10 | 20 | 105–106 | full-size variants |
+| 5 | 10 | 15 | 84 | 75 % |
+| 6 = 7 | 13 | 17 | 102 | 96 %/1800 (identical audiobar) |
+| 8 | 11 | 14 | 68 | 65 % |
+| 9, 10 | 9 | 13 | 63 | 60 % (9 = 10 audiobar; 10 swaps `app`/`fn`) |
+
+**`audiobar.txt`** (parser **`0x468540`**, log "init_audiobar failed"):
+* One line = one **bar**, and bar *i* is driven by **FFT band *i*** (30 Hz, 60 Hz, …), so a 15-line file uses bands 0..14 (≤ 1.5 kHz).
+* Within a line, `:` separates **segments from bottom to top** (≤ 8). `,` separates keys lit together in one segment (≤ 8).
+* Lines starting with `;` and empty lines are skipped. At most 23 bars.
+* Key names are resolved by `0x464b80`. Storage: `0x616abc + 0x108·bar` = segment count, `0x616ac0 + 4·(0x42·bar + 8·seg + key)`.
+* Rendering (`0x46693a`–`0x466b11`): with band level L (0..100) and S segments, the lowest ⌈L·S/100⌉ segments are lit. The top lit segment is dimmed by the fractional part.
+* Colour is `[0x6259f4]` (Monochrome) or the per-key palette `0x6168c0[k]` (Multicolor).
+
+Sample, `ET/8/audiobar.txt` (65 %):
+```
+ctrl:shift,k45:caps:tab,q:esc,1
+win,alt:z:a,s:w:2,3
+x,c:d:e,r:4
+v:f,g:t:5,6
+space:b,n:h:y,u:7
+m:j,k:i:8,9
+ralt:<,>:L:o,p:0
+fn:?:;,':[:-,=
+rctrl:rshift:enter:|:back
+left,down:up:del:ins
+right:pgdn:pgup
+```
+
+**`stream_h.txt`** (parser **`0x465b50`** → reader `0x465990`, log "init_stream failed"):
+* One line = one **vertical column**, ordered left to right. Keys are comma-separated, top to bottom (≤ 30 per column, stored 6 per row-slot).
+* Stored in the heap block `[0x625adc]` (0xE64 bytes): `+4 = 1`, `+8 = 30`, `+0xC = 200`, `+0x10 = 0xFF0000`, `+0x14 = 0x00FF00`, `+0x2C = 3`, and per-column phase offsets at `+0xC4 − 0x90·i`.
+* Used by the travelling "stream/wave" effects (tick `0x465b30` → `0x465cc0`), where column phase and band energy set the colour [inf on the exact animation].
+
+Sample, `ET/8/stream_h.txt`:
+```
+esc,tab,caps,shift,ctrl,win,k45
+1,Q,A,Z,alt
+2,W,S,X
+3,E,D,C
+4,R,F,V
+5,T,G,B,space
+6,Y,H,N
+7,U,J,M
+8,I,K,<
+9,O,L,>
+0,P,;,?,fn,-,[,'
+=,],back,|,enter,rshift,rctrl
+left,down,up,del,ins
+right,pgdn,pgup
+```
+
+**Effects are selected by `[0x6259e4]`**, the item data of the selected node in the "Effect" tree (`0x434dc0`, `TVM_GETNEXTITEM/TVGN_CARET`). The default is **3** (`0x4590e0`). Branches in `0x466030`:
+
+| Effect | Map file | Notes |
+|---|---|---|
+| 0 | audiobar.txt | spectrum bars (`0x4668f0`) |
+| 4 | audiobar.txt | bar variant (`0x466dd3`) |
+| 6 | **`happy.txt`** (same parser) | not shipped in any ET folder, so this effect fails to load ("init_audiobar failed" MessageBox) |
+| 1 | **`flower.txt`** (`0x465e10`) | not shipped, so "init_flower failed" |
+| 2, 3, 5, 7, 8, 9 | stream_h.txt | 3 = level-threshold colouring at 40/50/…/90 % on the `0x625ae0` per-key array; 7/8 use `0x450770`; 9 is random-based (`0x574a40`) [inf] |
+| 16 (0x10) | — | extra branch (`0x4683c9`) |
+
+* Which tree entry maps to which number was not resolved (the tree is filled at runtime) [?].
+* Other UI globals:
+  * `[0x6259e8]` colour mode: 0 = Monochrome, 1 = Multicolor (default 1).
+  * `[0x6259f4]` colour (default `0x00FF00`).
+  * `[0x6259ec]` gain index (default 5).
+  * `[0x6259f0]` smoothness (default 4).
+
+### 10.4 Start / stop (Q B4)
+
+* **No device command is sent before or after streaming.** There is no `AE 01` mode switch, no start flag and no stop/restore packet.
+* The on/off handler **`0x436a80`** only:
+  * **ON**: `CreateThread(0x463e10)` (capture) and `[0x6259e0] = 0`. Also starts UI timer `0x5e7` (35 ms) to animate `audio_bar.png`.
+  * **OFF**: clears the capture-run flag `capture+0x2b4 = 0` (the capture loop exits) and sets `[0x6259e0] = 1`. Also kills timer `0x5e7`.
+* The effect thread `0x466030` sends B1 frames only while `[0x6259e0] == 0` and the device reports open (`vtbl+0x14`, `0x466558`–`0x4665a0`). Otherwise it just sleeps.
+* So **music mode stops by simply ceasing B1 traffic.** Whatever the firmware shows afterwards (presumably its stored AE effect after a timeout) is decided on-device [inf].
+* Music is also forced off when CKeyTriggerDlg starts live-travel tracking (`0x41e076` → `0x436a80(0)`), so B1 and B6 03 polling never overlap.
+* Default state at start-up: music OFF (`[0x6259e0] = 1`, `0x4590d1`).
+
+### 10.5 Open items
+
+* Exact visual behaviour of effects 1–3, 5, 7–9 and 16, and the tree-item → effect-number mapping.
+* The writer (if any) of `gVar+0x47a4` (ET layout index).
+* The log base / dB scale of the band values.
+* Bootloader: byte +7 of the frame header, and whether the 32-byte `.enc` header carries a key/IV (it is passed through unchanged).

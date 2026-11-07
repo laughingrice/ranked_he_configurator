@@ -149,6 +149,7 @@ footer { margin: 28px 0 40px; color: var(--muted); font-size: 12.5px; }
     <button data-tab="macros">Macros</button>
     <button data-tab="options">Options</button>
     <button data-tab="profiles">Profiles</button>
+    <button data-tab="music">Music</button>
     <button data-tab="log">Log</button>
   </nav>
 
@@ -264,7 +265,7 @@ footer { margin: 28px 0 40px; color: var(--muted); font-size: 12.5px; }
         <label class="field"><span>Name</span><input type="text" id="mName" placeholder="sig"></label>
         <label class="field"><span>Pause after each tap (ms)</span><input type="number" id="mGap" value="10" min="0" max="1000"></label>
       </div>
-      <label class="field"><span>Steps</span><textarea id="mSteps" rows="3" placeholder='text:"Hello world" 200ms enter'></textarea></label>
+      <label class="field"><span>Steps</span><textarea id="mSteps" rows="3" placeholder='text:"Best, Micha" 200ms enter'></textarea></label>
       <div class="muted small" id="mPreview"></div>
       <div class="row"><button class="btn primary" id="mSave">Save macro</button>
         <button class="btn danger" id="mDelete">Delete</button>
@@ -283,16 +284,21 @@ footer { margin: 28px 0 40px; color: var(--muted); font-size: 12.5px; }
 
   <!-- OPTIONS -->
   <section class="panel card stack" data-panel="options" hidden>
+    <div class="muted small" id="oSource"></div>
     <label class="row"><input type="checkbox" id="oCaps"> Caps Lock LED</label>
-    <details><summary>Advanced (hidden for this model in the official app; no visible effect on the Master 65%)</summary>
+    <details><summary>Advanced (hidden in the official app for this model)</summary>
       <div class="grid2" style="margin-top:10px">
         <label class="row"><input type="checkbox" id="oTap"> Tap mode</label>
         <label class="field"><span>Tap time <b id="oTapTimeV"></b></span><input type="range" id="oTapTime" min="0" max="100"></label>
         <label class="field"><span>Debounce <b id="oDebV"></b></span><input type="range" id="oDeb" min="0" max="5"></label>
         <label class="field"><span>Magic Fn</span><select id="oMagic"><option value="0">0 (off)</option><option value="1">1</option><option value="2">2</option></select></label>
-      </div></details>
+      </div>
+      <p class="muted small">On the Master 65%, tap mode makes a hidden layer replace keys: they fire on release and stay
+        pressed until the next key. Leave it off unless you're experimenting. Debounce and Magic Fn had no visible effect.</p>
+    </details>
     <div class="row"><button class="btn primary" id="oApply">Apply</button>
-      <button class="btn" id="oDefaults">Official app defaults</button></div>
+      <button class="btn" id="oFactory">Keyboard factory values</button>
+      <button class="btn" id="oDefaults">Official app values</button></div>
   </section>
 
   <!-- PROFILES -->
@@ -321,6 +327,31 @@ footer { margin: 28px 0 40px; color: var(--muted); font-size: 12.5px; }
         <button class="btn danger" id="sForget">Forget (assume factory)</button>
       </div>
     </div>
+  </section>
+
+  <!-- MUSIC -->
+  <section class="panel card stack" data-panel="music" hidden>
+    <div><h2>Music-reactive lighting</h2>
+      <div class="muted small">The page listens to audio, turns it into key colours and streams them to the keyboard
+        about 25 times a second. Stopping restores your saved lighting. Keep this tab visible while it runs:
+        browsers slow down hidden tabs.</div></div>
+    <div class="grid2">
+      <label class="field"><span>Audio source</span><select id="muSource">
+        <option value="tab">A browser tab (tick “Share tab audio”)</option>
+        <option value="mic">Microphone</option></select></label>
+      <label class="field"><span>Effect</span><select id="muEffect">
+        <option value="bars">Spectrum bars</option>
+        <option value="rainbow">Rainbow spectrum</option>
+        <option value="pulse">Bass pulse</option></select></label>
+      <label class="field"><span>Colours</span><div class="row" style="flex-wrap:nowrap">
+        <select id="muColorMode"><option value="grad">Green → red</option><option value="one">Single colour</option></select>
+        <input type="color" id="muColor" value="#00a0ff"></div></label>
+      <label class="field"><span>Sensitivity <b id="muGainV"></b></span><input type="range" id="muGain" min="1" max="30" value="10"></label>
+      <label class="field"><span>Smoothing <b id="muSmoothV"></b></span><input type="range" id="muSmooth" min="0" max="95" value="70"></label>
+      <label class="field"><span>Brightness <b id="muBrightV"></b></span><input type="range" id="muBright" min="10" max="100" value="100"></label>
+    </div>
+    <div class="row"><button class="btn primary" id="muStart">Start</button>
+      <span class="muted small" id="muInfo"></span></div>
   </section>
 
   <!-- LOG -->

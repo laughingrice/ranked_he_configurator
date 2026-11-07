@@ -169,13 +169,13 @@ class Keyboard:
         p = bytes(payload)
         allowed = (p[:4] == CMD_GET_PSD or p[:2] == bytes([0xAE, 0x01])
                    or p[:2] == bytes([0xB6, 0x03])   # AskTrigger (read-only)
-                   or (p[0] == 0xB6 and p[1] in (0x01, 0x04, 0x05))  # trigger tables
+                   or (p[0] == 0xB6 and p[1] in (0x01, 0x02, 0x04, 0x05))  # trigger tables
                    or (p[0] == 0xB5 and len(p) == 9 and p[7:9] == b"\x00\x01")  # options
                    or p == bytes([0xAA, 0x00])                       # free all macros
                    or (p[0] == 0xA7 and len(p) == 4)                 # allocate macro
                    or (p[0] == 0xA8 and len(p) <= 63)                # macro data
                    or (p[:3] == bytes([0xA0, 0x02, 0x04]) and len(p) == 61
-                       and p[4] == 0x0E and p[5] in (1, 2, 3, 5) and p[60] == 0xA5))  # keymap
+                       and p[4] == 0x0E and p[5] in (1, 2, 3, 4, 5) and p[60] == 0xA5))  # keymap
         if not allowed:
             raise RuntimeError(f"Blocked: command {hexs(p[:4])} is not whitelisted in this tool")
         wire = bytes([REPORT_ID]) + p + bytes(63 - len(p))
@@ -219,7 +219,12 @@ def cmd_info(a):
         r = kb.handshake(verbose=a.verbose)
         v = kb.release
         print(f"{kb.product}: model code {hexs(r[5:8])} OK, firmware V{(v>>8)&0xF:X}.{(v>>4)&0xF:X}.{v&0xF:X}")
-        print("extra reply bytes:", hexs(r[8:18]))
+        o = _options_from_reply(r)
+        if o:
+            print(f"options: Caps LED {'on' if o['caps_led'] else 'off'}, tap {'on' if o['tap'] else 'off'} "
+                  f"({o['tap_time']*10} ms), debounce {o['debounce']}/{o['debounce_time']}, "
+                  f"Magic Fn {o['magic_fn']}")
+        print("reply bytes 8-17:", hexs(r[8:18]), " (8-9 unknown, 10-15 options)")
     finally:
         kb.close()
 
@@ -449,13 +454,16 @@ def cmd_rt_test(a):
                 n = L.hid_read_timeout(h, buf, 64, 0)
                 if n <= 0:
                     break
-                handle(buf.raw[:n])
+                handle(buf.raw[:n], h)
 
     depth, down, events = 0, False, 0
     got = []
+    sources, pressed = {}, set()      # key state per (interface, report id); union = pressed
+    rev = {v: k for k, v in HID_USAGE.items()}
+    rev.update({v: k for k, v in MOD_USAGE.items()})
 
-    def handle(r):
-        nonlocal down, events
+    def handle(r, src=None):
+        nonlocal down, events, pressed
         if r and (r[0] == 0xB7 or (r[0] == REPORT_ID and len(r) > 1 and r[1] == 0xB7)):
             if r[0] == 0xB7:
                 r = bytes([REPORT_ID]) + r
@@ -464,11 +472,17 @@ def cmd_rt_test(a):
         ks = _key_state(r)
         if ks is None:
             return
-        now = usage in ks
-        if now != down:
-            down = now
+        if len(r) >= 64:                       # NKRO report: add modifier byte as usages
+            ks |= {0xE0 + i for i in range(8) if r[1] & (1 << i)}
+        sources[(src, r[0] if len(r) >= 64 else "boot")] = ks
+        now_set = set().union(*sources.values())
+        for u in sorted(now_set ^ pressed):
+            is_down = u in now_set
             events += 1
-            sys.stdout.write(f"\r\033[K  {'PRESS  ' if now else 'RELEASE'} at {depth/10:.1f} mm\n")
+            sys.stdout.write(f"\r\033[K  {'PRESS  ' if is_down else 'RELEASE'} "
+                             f"{rev.get(u, hex(u)):<7} at {depth/10:.1f} mm\n")
+        pressed = now_set
+        down = usage in pressed
 
     try:
         kb.handshake()
@@ -508,7 +522,7 @@ def cmd_rt_test(a):
 # protocol.md 8.2: per layer 126 records x 6 bytes = [keyIdx][c0 c1 c2 c3][00] at keyIdx*6,
 # all-zero record = not set (transparent in Fn/tap layers). 14 packets of 9 records:
 #   A0 02 04 <pkt 1..14> 0E <layerID> <54 bytes> A5   (layer IDs: base 1, fn1 2, fn2 3, tap 5)
-LAYER_IDS = {"base": 1, "fn1": 2, "fn2": 3, "tap": 5}
+LAYER_IDS = {"base": 1, "fn1": 2, "fn2": 3, "tap": 5, "slot4": 4}   # slot4: EXPERIMENTAL, never sent by the official app on HE boards
 
 VK_HID = {**{0x41 + i: 0x04 + i for i in range(26)},                      # A-Z
           **{0x31 + i: 0x1E + i for i in range(9)}, 0x30: 0x27,            # 1-9, 0
@@ -604,7 +618,7 @@ def _default_layers():
     fn2[118] = (0xFB, SPECIAL["led-bright-"], 0, 0)     # Fn2+Down
     fn2[119] = (0xFB, SPECIAL["led-speed+"], 0, 0)      # Fn2+Right
     fn2[97] = (0xFB, SPECIAL["led-bright+"], 0, 0)      # Fn2+Up
-    return {"base": base, "fn1": fn1, "fn2": fn2, "tap": [None] * 126}
+    return {"base": base, "fn1": fn1, "fn2": fn2, "tap": [None] * 126, "slot4": [None] * 126}
 
 
 def _parse_macro_target(s):
@@ -706,7 +720,9 @@ def _describe(rec):
 def _load_layers():
     s = _read_state_file()
     if "layers" in s:
-        return {k: [tuple(r) if r else None for r in v] for k, v in s["layers"].items()}, True
+        out = _default_layers()          # layers missing from older state files stay factory/empty
+        out.update({k: [tuple(r) if r else None for r in v] for k, v in s["layers"].items()})
+        return out, True
     return _default_layers(), False
 
 
@@ -801,7 +817,7 @@ def _save_layers(layers):
 def cmd_map_reset(a):
     layers, _ = _load_layers()
     d = _default_layers()
-    names = list(LAYER_IDS) if a.layer == "all" else [a.layer]
+    names = [L for L in LAYER_IDS if L != "slot4"] if a.layer == "all" else [a.layer]
     for L in names:
         layers[L] = d[L]
         print(f"restoring factory {L} layer")
@@ -1438,6 +1454,8 @@ def cmd_profile_load(a):
         for L in LAYER_IDS:
             if L not in p["keymap"]:
                 continue
+            if L == "slot4" and not any(p["keymap"][L]):
+                continue                     # experimental slot: only send it if used
             # skip layers that already match what this tool last wrote (saves time)
             if cur_layers and not a.full and [tuple(r) if r else None
                                               for r in cur_layers.get(L, [])] == layers[L]:
@@ -1567,61 +1585,77 @@ def _options_payload(o):
                   o["magic_fn"], o["caps_led"], 0x00, 0x01])
 
 
-def cmd_options(a):
-    s = _read_state_file()
-    o = dict(OPT_DEFAULTS, **s.get("options", {}))
-    known = "options" in s
-    onoff = {"on": 1, "off": 0}
-    changed = False
-    if a.caps_led is not None:
-        o["caps_led"] = onoff[a.caps_led]; changed = True
-    if a.tap is not None:
-        o["tap"] = onoff[a.tap]; changed = True
-    if a.tap_time is not None:
-        if not 0 <= a.tap_time <= 1000 or a.tap_time % 10:
-            sys.exit("--tap-time must be 0..1000 ms in steps of 10")
-        o["tap_time"] = a.tap_time // 10; changed = True
-    if a.debounce is not None:
-        if not 0 <= a.debounce <= 5:
-            sys.exit("--debounce must be 0..5")
-        o["debounce"] = a.debounce; changed = True
-    if a.magic_fn is not None:
-        o["magic_fn"] = a.magic_fn; changed = True
-    if a.app_defaults:
-        o = dict(OPT_DEFAULTS); changed = True
+OPT_FIELDS = ("tap", "tap_time", "debounce", "debounce_time", "magic_fn", "caps_led")
+# keyboard factory values, read back on a freshly reset Master 65%
+OPT_FACTORY = {"tap": 0, "tap_time": 13, "debounce": 0, "debounce_time": 1, "magic_fn": 0,
+               "caps_led": 1}
 
-    def show():
-        print(f"  Caps Lock LED : {'on' if o['caps_led'] else 'off'}")
-        print(f"  tap           : {'on' if o['tap'] else 'off'}, {o['tap_time']*10} ms  (hidden for this model)")
-        print(f"  debounce      : {o['debounce']}  (hidden for this model; likely mechanical boards only)")
-        print(f"  Magic Fn mode : {o['magic_fn']}  (hidden for this model)")
-    if not changed:
-        print("Options last written by this tool:" if known else
-              "(nothing written by this tool yet - showing the official app's defaults)")
-        show()
-        return
-    for k, label in (("tap", "tap"), ("tap_time", "tap time"), ("debounce", "debounce"),
-                     ("magic_fn", "Magic Fn")):
-        if o[k] != OPT_DEFAULTS[k]:
-            print(f"note: {label} differs from what the official app sends for this model; "
-                  "its effect on this keyboard is unknown (Fn2+Esc undoes it)")
-    payload = _options_payload(o)
-    print("Sending:")
-    show()
-    if a.dry_run:
-        print("would send:", hexs(bytes([REPORT_ID]) + payload), "+ zero padding")
-        return
+
+def _options_from_reply(r):
+    """The GetPSD reply carries the current B5 options at wire bytes 10..15 (+ 00 01 trailer),
+    found by comparing replies before/after each change on the device."""
+    if r is None or len(r) < 18 or r[16:18] != b"\x00\x01":
+        return None
+    return dict(zip(OPT_FIELDS, r[10:16]))
+
+
+def cmd_options(a):
+    onoff = {"on": 1, "off": 0}
     kb = Keyboard()
     try:
-        kb.handshake(verbose=a.verbose)
-        r = kb.send(payload, verbose=a.verbose)
+        r = kb.handshake(verbose=a.verbose)
+        cur = _options_from_reply(r)
+        if cur is None:
+            sys.exit("Couldn't read the current options from the keyboard; nothing sent.")
+        o = dict(cur)
+        if a.app_defaults:
+            o = dict(OPT_DEFAULTS)
+        if a.factory:
+            o = dict(OPT_FACTORY)
+        if a.caps_led is not None:
+            o["caps_led"] = onoff[a.caps_led]
+        if a.tap is not None:
+            o["tap"] = onoff[a.tap]
+        if a.tap_time is not None:
+            if not 0 <= a.tap_time <= 1000 or a.tap_time % 10:
+                sys.exit("--tap-time must be 0..1000 ms in steps of 10")
+            o["tap_time"] = a.tap_time // 10
+        if a.debounce is not None:
+            if not 0 <= a.debounce <= 5:
+                sys.exit("--debounce must be 0..5")
+            o["debounce"] = a.debounce
+        if a.magic_fn is not None:
+            o["magic_fn"] = a.magic_fn
+
+        def show(x):
+            print(f"  Caps Lock LED : {'on' if x['caps_led'] else 'off'}")
+            print(f"  tap mode      : {'on' if x['tap'] else 'off'}, {x['tap_time']*10} ms"
+                  "  (on = layer slot4 replaces keys; buggy on this model)")
+            print(f"  debounce      : {x['debounce']} (time {x['debounce_time']})"
+                  "  (no visible effect on this model)")
+            print(f"  Magic Fn mode : {x['magic_fn']}  (no visible effect on this model)")
+        if o == cur:
+            print("Current options (read from the keyboard):")
+            show(cur)
+            _save_state({"options": cur})
+            return
+        print("Changing:", ", ".join(f"{k} {cur[k]} -> {o[k]}" for k in OPT_FIELDS if o[k] != cur[k]))
+        payload = _options_payload(o)
+        if a.dry_run:
+            print("would send:", hexs(bytes([REPORT_ID]) + payload), "+ zero padding")
+            return
+        if not kb.send(payload, verbose=a.verbose):
+            sys.exit("No acknowledgement; nothing changed.")
+        after = _options_from_reply(kb.send(CMD_GET_PSD))
     finally:
         kb.close()
-    if r:
-        _save_state({"options": o})
-        print("OK - keyboard acknowledged.")
+    if after != o:
+        print("warning: the keyboard reports different values than were sent:")
+        show(after or o)
     else:
-        print("No acknowledgement; nothing saved.")
+        print("OK - verified on the keyboard:")
+        show(o)
+    _save_state({"options": after or o})
 
 
 def _split_list(spec):
@@ -1747,6 +1781,54 @@ def cmd_trigger_reset(a):
     print("Writing factory values: actuation 2.0 mm, rapid trigger off, all keys")
     if _write_tables(state, list(TABLES), a.dry_run, a.verbose) and not a.dry_run:
         _save_state(state)
+
+
+def cmd_trigger_second(a):
+    """EXPERIMENTAL: second actuation point (B6 02). The official app has a UI for it but
+    never sends it; what the keyboard does at that depth is unknown (guess: the tap layer,
+    which magnetic boards keep in slot 5). Keys not given stay at 0 = assumed off."""
+    import time
+    s = _read_state_file()
+    t2 = list(s.get("actuation2") or [0] * 126)
+    state, _ = _load_state()
+    if a.off:
+        keys = _parse_keys(a.keys) if a.keys else list(range(126))
+        for p in keys:
+            t2[p] = 0
+    else:
+        if a.at is None or not a.keys:
+            sys.exit("Give --keys and --at MM (or --off)")
+        b = int(round(a.at * 10))
+        if not 2 <= b <= 38:
+            sys.exit("--at must be 0.2..3.8 mm")
+        for p in _parse_keys(a.keys):
+            act = state["actuation"][p]
+            if b <= act and not a.any_order:
+                sys.exit(f"{KEY_AT[p]}: second point {a.at} mm must be deeper than its actuation "
+                         f"{act/10:.1f} mm (the official app enforces this)")
+            if act >= 9:
+                print(f"note: {KEY_AT[p]} actuation is {act/10:.1f} mm; the official app only "
+                      "allows a second point when actuation is below 0.9 mm")
+            t2[p] = b
+    on = [f"{KEY_AT[p]}={t2[p]/10:.1f}" for p in sorted(KEY_AT) if t2[p]]
+    print("second point:", ", ".join(on) if on else "off on all keys")
+    pk = [bytes([0xB6, 0x02, 0x00, i]) + bytes(t2[off:off + 59]) for i, off in enumerate((0, 59, 118))]
+    if a.dry_run:
+        for x in pk:
+            print("would send:", hexs(bytes([REPORT_ID]) + x)[:120], "...")
+        return
+    kb = Keyboard()
+    try:
+        kb.handshake(verbose=a.verbose)
+        for x in pk:
+            time.sleep(0.02)
+            if not kb.send(x, verbose=a.verbose):
+                sys.exit(f"No acknowledgement for packet {x[3]} - the firmware may not support "
+                         "B6 02. Nothing saved; Fn2+Esc resets if anything acts up.")
+    finally:
+        kb.close()
+    _save_state({"actuation2": t2})
+    print("OK - written. Test with: python ranked.py rt-test --key " + (a.keys or "F").split(",")[0])
 
 
 def cmd_trigger_auto(a):
@@ -1875,7 +1957,7 @@ def main():
 
     mc = sub.add_parser("macro", help="define macros; bind with map set --to macro:NAME")
     mcs = mc.add_subparsers(dest="mccmd", required=True)
-    c1 = mcs.add_parser("add", help='e.g. macro add sig "text:\\"Hello World\\""')
+    c1 = mcs.add_parser("add", help='e.g. macro add sig "text:\\"Best, Micha\\""')
     c1.add_argument("name")
     c1.add_argument("steps", help='space-separated: cmd+c  250ms  text:"hi"  down:shift  raw:08  '
                                   'up:shift  click:left  wheel:down*3')
@@ -1913,13 +1995,15 @@ def main():
     m3.add_argument("--dry-run", action="store_true")
     m3.set_defaults(fn=cmd_map_reset)
 
-    op = sub.add_parser("options", help="Caps Lock LED, tap, debounce, Magic Fn (no args = show)")
+    op = sub.add_parser("options", help="Caps Lock LED, tap, debounce, Magic Fn (no args = read from keyboard)")
     op.add_argument("--caps-led", choices=["on", "off"])
     op.add_argument("--tap", choices=["on", "off"], help="advanced; hidden for this model")
     op.add_argument("--tap-time", type=int, help="ms, 0-1000 step 10; advanced")
     op.add_argument("--debounce", type=int, help="0-5; advanced, likely mechanical only")
     op.add_argument("--magic-fn", type=int, choices=[0, 1, 2], help="advanced")
-    op.add_argument("--app-defaults", action="store_true", help="send the official app's values")
+    op.add_argument("--app-defaults", action="store_true",
+                    help="the official app's values (note: these turn tap mode ON)")
+    op.add_argument("--factory", action="store_true", help="the keyboard's own factory values")
     op.add_argument("--dry-run", action="store_true")
     op.set_defaults(fn=cmd_options)
 
@@ -1937,6 +2021,14 @@ def main():
     r = ts.add_parser("reset", help="write factory values (2.0 mm, RT off)")
     r.add_argument("--dry-run", action="store_true")
     r.set_defaults(fn=cmd_trigger_reset)
+    sc = ts.add_parser("second", help="EXPERIMENTAL second actuation point (B6 02)")
+    sc.add_argument("--keys", help="comma list")
+    sc.add_argument("--at", type=float, help="depth in mm, deeper than the key's actuation")
+    sc.add_argument("--off", action="store_true", help="turn off (listed keys, or all)")
+    sc.add_argument("--any-order", action="store_true",
+                    help="allow a second point shallower than actuation (experiment)")
+    sc.add_argument("--dry-run", action="store_true")
+    sc.set_defaults(fn=cmd_trigger_second)
     au = ts.add_parser("auto", help="measure noise, set RT sensitivity safely per key")
     au.add_argument("--rt", type=float, required=True, help="desired RT sensitivity, mm")
     au.add_argument("--actuation", type=float, help="optional actuation for all keys, mm")

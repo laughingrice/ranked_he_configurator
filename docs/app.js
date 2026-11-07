@@ -48,9 +48,16 @@ class Device {
     const psd = Array.from(r.slice(4, 7));
     if (psd.join() !== C.EXPECTED_PSD.join())
       throw new Error(`Unexpected model code ${hex(psd)} (expected ${hex(C.EXPECTED_PSD)}). Not a Master 65%?`);
+    this.opts = C.optionsFromReply(r);
     this.ready = true;
   }
-  connectDemo() { this.hid = null; this.demo = true; this.ready = true; }
+  connectDemo() { this.hid = null; this.demo = true; this.ready = true; this.demoOpts = { ...C.OPT_FACTORY }; this.opts = { ...C.OPT_FACTORY }; }
+  // read the current options from the keyboard (they come back in the handshake reply)
+  async readOptions() {
+    const r = await this.exclusive(() => this.req(C.GET_PSD, { quiet: true }));
+    this.opts = C.optionsFromReply(r);
+    return this.opts;
+  }
   async disconnect() {
     this.ready = false;
     if (this.hid) { try { await this.hid.close(); } catch (e) { /* already gone */ } }
@@ -79,7 +86,9 @@ class Device {
       await sleep(2);
       if (!echo) return null;
       const r = new Uint8Array(63); r[0] = p[0]; r[1] = 1;
-      if (p[0] === 0xA0 && p[3] === 0x01) r.set([0xA0, 0x02, 0x00, 0x01, ...C.EXPECTED_PSD], 0);
+      if (p[0] === 0xB5) C.OPT_FIELDS.forEach((k, i) => { this.demoOpts[k] = p[1 + i]; });
+      if (p[0] === 0xA0 && p[3] === 0x01) r.set([0xA0, 0x02, 0x00, 0x01, ...C.EXPECTED_PSD, 0x01, 0x00,
+        ...C.OPT_FIELDS.map((k) => this.demoOpts[k]), 0x00, 0x01], 0);
       if (!quiet) log("rx", "RX (demo) " + hex(r.slice(0, 8)) + " …");
       return r;
     }
@@ -218,7 +227,7 @@ async function connect(hid) {
   setStatus();
 }
 $("#btnConnect").onclick = async () => {
-  if (dev.ready && !dev.demo) { stopLive(); await dev.disconnect(); setStatus(); return; }
+  if (dev.ready && !dev.demo) { stopLive(); await stopMusic(); await dev.disconnect(); setStatus(); return; }
   if (!("hid" in navigator)) { toast("This browser has no WebHID - use Chrome or Edge.", "err"); return; }
   if (dev.demo) await dev.disconnect();
   try {
@@ -228,12 +237,12 @@ $("#btnConnect").onclick = async () => {
   } catch (e) { toast(e.message, "err"); }
 };
 $("#btnDemo").onclick = async () => {
-  stopLive();
+  stopLive(); await stopMusic();
   if (dev.demo) await dev.disconnect(); else { await dev.disconnect(); dev.connectDemo(); toast("Demo mode: commands are only logged, nothing is sent.", "ok"); }
   setStatus();
 };
 if ("hid" in navigator) {
-  navigator.hid.addEventListener("disconnect", (e) => { if (dev.hid === e.device) { stopLive(); dev.disconnect(); setStatus(); toast("Keyboard disconnected"); } });
+  navigator.hid.addEventListener("disconnect", (e) => { if (dev.hid === e.device) { stopLive(); dev.disconnect(); stopMusic(); setStatus(); toast("Keyboard disconnected"); } });
   navigator.hid.addEventListener("connect", (e) => { if (!dev.ready && isVendor(e.device)) connect(e.device); });
   navigator.hid.getDevices().then((ds) => { const d = ds.find(isVendor); if (d && !dev.ready) connect(d); });
 } else $("#noHid").hidden = false;
@@ -246,9 +255,9 @@ function showTab(t) {
   TAB = t;
   $$("#tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === t)));
   $$(".panel").forEach((p) => (p.hidden = p.dataset.panel !== t));
-  $("#kbCard").hidden = !["rgb", "trigger", "keymap"].includes(t);
+  $("#kbCard").hidden = !["rgb", "trigger", "keymap", "music"].includes(t);
   ({ lighting: initLighting, rgb: renderRgb, trigger: renderTrig, keymap: renderMap,
-     macros: renderMacros, options: initOptions, profiles: renderProfiles, log: renderLog })[t]?.();
+     macros: renderMacros, options: initOptions, profiles: renderProfiles, music: renderMusicKb, log: renderLog })[t]?.();
   renderKb();
 }
 
@@ -389,6 +398,7 @@ function stopLive() {
 }
 $("#tLive").onclick = async () => {
   if (liveRun) return stopLive();
+  if (music) await stopMusic();
   try { need(); } catch (e) { return toast(e.message, "err"); }
   liveRun = true; $("#tLive").textContent = "Stop live view";
   $("#tLiveInfo").textContent = "Press keys to see their depth.";
@@ -540,15 +550,38 @@ $("#mDelete").onclick = () => busy("#mDelete", async () => {
 });
 
 // ------------------------------------------------------------------ options tab
-function initOptions() { const o = sOptions();
+// options can be read back (handshake reply), so the form always starts from the keyboard
+function fillOptions(o) {
   $("#oCaps").checked = !!o.caps_led; $("#oTap").checked = !!o.tap; $("#oTapTime").value = o.tap_time;
-  $("#oDeb").value = o.debounce; $("#oMagic").value = o.magic_fn; optLabels(); }
+  $("#oDeb").value = o.debounce; $("#oMagic").value = o.magic_fn; optLabels();
+}
+const formOptions = (base) => ({ ...base, caps_led: +$("#oCaps").checked, tap: +$("#oTap").checked,
+  tap_time: +$("#oTapTime").value, debounce: +$("#oDeb").value, magic_fn: +$("#oMagic").value });
+async function initOptions() {
+  if (!dev.ready) { fillOptions(sOptions()); $("#oSource").textContent = "Not connected: showing what this page last wrote."; return; }
+  try {
+    const o = await dev.readOptions();
+    if (!o) throw new Error("The keyboard didn't report its options.");
+    fillOptions(o); S.options = { ...o }; saveS();
+    $("#oSource").textContent = "Read from the keyboard.";
+  } catch (e) { toast(e.message, "err"); }
+}
 const optLabels = () => { $("#oTapTimeV").textContent = $("#oTapTime").value * 10 + " ms"; $("#oDebV").textContent = $("#oDeb").value; };
 $("#oTapTime").oninput = optLabels; $("#oDeb").oninput = optLabels;
-$("#oApply").onclick = () => busy("#oApply", () => opOptions({ ...sOptions(), caps_led: +$("#oCaps").checked, tap: +$("#oTap").checked,
-  tap_time: +$("#oTapTime").value, debounce: +$("#oDeb").value, magic_fn: +$("#oMagic").value }), "Options applied");
-$("#oDefaults").onclick = () => { const o = C.OPT_DEFAULTS; $("#oCaps").checked = !!o.caps_led; $("#oTap").checked = !!o.tap;
-  $("#oTapTime").value = o.tap_time; $("#oDeb").value = o.debounce; $("#oMagic").value = o.magic_fn; optLabels(); };
+$("#oApply").onclick = () => busy("#oApply", async () => {
+  need();
+  const cur = await dev.readOptions();
+  if (!cur) throw new Error("Couldn't read the current options; nothing sent.");
+  const want = formOptions(cur);
+  if (C.OPT_FIELDS.every((k) => want[k] === cur[k])) { toast("No changes - the keyboard already has these values."); return; }
+  await opOptions(want);
+  const after = await dev.readOptions();
+  if (!after || C.OPT_FIELDS.some((k) => after[k] !== want[k])) throw new Error("The keyboard reports different values than were sent.");
+  S.options = { ...after }; saveS(); fillOptions(after);
+  toast("Options applied and verified on the keyboard", "ok");
+});
+$("#oFactory").onclick = () => fillOptions(C.OPT_FACTORY);
+$("#oDefaults").onclick = () => fillOptions(C.OPT_DEFAULTS);
 
 // ------------------------------------------------------------------ profiles + settings file
 function snapshot() {   // same as ranked.py _snapshot()
@@ -623,6 +656,120 @@ $("#sImport").onchange = async (e) => { const r = await readJsonFile(e.target); 
   toast("Settings file imported. Nothing was sent - load a profile or press Write to push it to the keyboard.", "ok"); renderProfiles(); };
 $("#sForget").onclick = () => { S = {}; saveS(); W_rgb = sRgb(); W_t = sTriggers(); W_l = sLayers(); toast("Forgot all written settings (assuming factory).", "ok"); renderProfiles(); };
 $("#logClear").onclick = () => { LOG.length = 0; renderLog(); };
+
+// ------------------------------------------------------------------ music (live per-key stream)
+let music = null;              // {ctx, an, stream, timer, frame, frames}
+const MU_COLS = 15;            // spectrum columns across the board, from key x-centres
+const keyCol = Object.fromEntries(C.KEYS.map((k) => [k.pos, Math.min(MU_COLS - 1, Math.floor(((k.x1 + k.x2) / 2 - 9) / 610 * MU_COLS))]));
+const keyRow = Object.fromEntries(C.KEYS.map((k) => [k.pos, Math.round((k.y1 - 9) / 40)]));   // 0 top .. 4 bottom
+// log-spaced band edges, 40 Hz .. 12 kHz
+const MU_EDGES = Array.from({ length: MU_COLS + 1 }, (_, i) => 40 * Math.pow(12000 / 40, i / MU_COLS));
+const hsv = (h, s, v) => { const f = (n) => { const k = (n + h * 6) % 6; return v - v * s * Math.max(0, Math.min(k, 4 - k, 1)); };
+  return [f(5), f(3), f(1)].map((x) => Math.round(x * 255)); };
+const hexRgb = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+["#muGain", "#muSmooth", "#muBright"].forEach((id) => ($(id).oninput = muLabels));
+function muLabels() { $("#muGainV").textContent = $("#muGain").value; $("#muSmoothV").textContent = $("#muSmooth").value + "%";
+  $("#muBrightV").textContent = $("#muBright").value + "%"; if (music) music.an.smoothingTimeConstant = $("#muSmooth").value / 100; }
+muLabels();
+
+async function getAudio(src) {
+  if (src === "mic") return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  const st = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  st.getVideoTracks().forEach((t) => t.stop());
+  if (!st.getAudioTracks().length) throw new Error("No audio shared - pick a tab and tick “Share tab audio”.");
+  return st;
+}
+function bandLevels() {
+  const an = music.an, data = music.buf;
+  an.getFloatFrequencyData(data);
+  const hz = an.context.sampleRate / an.fftSize, gain = +$("#muGain").value / 10;
+  const lv = [];
+  for (let c = 0; c < MU_COLS; c++) {
+    const a = Math.max(1, Math.floor(MU_EDGES[c] / hz)), b = Math.max(a + 1, Math.ceil(MU_EDGES[c + 1] / hz));
+    let m = -Infinity; for (let i = a; i < b && i < data.length; i++) m = Math.max(m, data[i]);
+    const tilt = c * 1.2;                                  // treble is quieter; lift it a bit
+    lv.push(Math.max(0, Math.min(1, ((m + tilt) + 85) / 55 * gain)));
+  }
+  return lv;
+}
+function renderFrame(lv, t) {
+  const frame = new Array(378).fill(0), eff = $("#muEffect").value, bright = +$("#muBright").value / 100;
+  const one = hexRgb($("#muColor").value), grad = $("#muColorMode").value === "grad";
+  const bass = (lv[0] + lv[1] + lv[2]) / 3;
+  for (const k of C.KEYS) {
+    const c = keyCol[k.pos], row = keyRow[k.pos], h = (4 - row) / 4;     // h: 0 bottom .. 1 top
+    let rgb = [0, 0, 0];
+    if (eff === "bars") {
+      if (lv[c] * 5 > 4 - row + 0.15) rgb = grad ? hsv(0.33 * (1 - h), 1, 1) : one;
+    } else if (eff === "rainbow") {
+      rgb = hsv((c / MU_COLS + t / 8000) % 1, 1, Math.min(1, lv[c] * 1.3));
+    } else {
+      const v = Math.pow(bass, 1.6);
+      rgb = (grad ? hsv((t / 12000) % 1, 1, 1) : one).map((x) => x * v);
+    }
+    rgb.forEach((x, i) => { frame[k.pos * 3 + i] = Math.round(x * bright); });
+  }
+  return frame;
+}
+async function startMusic() {
+  need();
+  stopLive();
+  const stream = await getAudio($("#muSource").value);
+  const ctx = new AudioContext(), an = ctx.createAnalyser();
+  an.fftSize = 4096; an.smoothingTimeConstant = $("#muSmooth").value / 100;
+  ctx.createMediaStreamSource(stream).connect(an);            // not connected to the speakers: no echo
+  music = { ctx, an, stream, buf: new Float32Array(an.frequencyBinCount), frames: 0, t0: performance.now(), busy: false };
+  stream.getAudioTracks()[0].addEventListener("ended", () => stopMusic());
+  $("#muStart").textContent = "Stop"; $("#muStart").classList.remove("primary");
+  log("tx", "music: streaming B1 frames (not logged individually)");
+  const tick = async () => {
+    if (!music) return;
+    const t = performance.now(), frame = renderFrame(bandLevels(), t);
+    music.frame = frame;
+    if (!music.busy) {
+      music.busy = true;
+      try {
+        await dev.exclusive(async () => { for (const p of C.streamPackets(frame)) await dev.req(p, { echo: false, quiet: true }); });
+        music.frames++;
+      } catch (e) { toast(e.message, "err"); stopMusic(); return; }
+      finally { if (music) music.busy = false; }
+    }
+    if (TAB === "music") renderMusicKb();
+    const fps = music.frames / ((performance.now() - music.t0) / 1000);
+    $("#muInfo").textContent = `${music.frames} frames · ${fps.toFixed(0)} fps`;
+    music.timer = setTimeout(tick, Math.max(5, 40 - (performance.now() - t)));   // aim for ~25 fps
+  };
+  tick();
+}
+async function stopMusic() {
+  if (!music) return;
+  const m = music; music = null;
+  clearTimeout(m.timer);
+  m.stream.getTracks().forEach((t) => t.stop());
+  m.ctx.close().catch(() => {});
+  $("#muStart").textContent = "Start"; $("#muStart").classList.add("primary");
+  $("#muInfo").textContent = "Stopped.";
+  if (TAB === "music") renderMusicKb();
+  // put back the lighting this page last wrote, if any
+  const L = S.lighting;
+  if (L && dev.ready) {
+    await sleep(100);
+    try { if (L.color === 255) await opRgb(L.keys || {}, L.brightness); else await opLed(L.mode, L.speed, L.brightness, L.color); }
+    catch (e) { /* keyboard may be gone */ }
+  }
+}
+function renderMusicKb() {
+  overlay = (p) => { if (!music || !music.frame) return {};
+    const r = music.frame[p * 3], g = music.frame[p * 3 + 1], b = music.frame[p * 3 + 2];
+    if (!r && !g && !b) return {};
+    const h = [r, g, b].map((x) => x.toString(16).padStart(2, "0")).join("");
+    return { bg: "#" + h, fg: contrast(h) }; };
+  if (TAB === "music") { $("#kbHint").textContent = music ? "Live preview of what's sent to the keyboard." : "Press Start to begin."; renderKb(); }
+}
+$("#muStart").onclick = async () => {
+  if (music) return stopMusic();
+  try { await startMusic(); } catch (e) { toast(e.name === "NotAllowedError" ? "Audio access was declined." : e.message, "err"); await stopMusic(); }
+};
 
 // ------------------------------------------------------------------ start
 const repo = location.hostname.endsWith("github.io")
