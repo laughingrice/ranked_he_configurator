@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ranked HE Configurator</title>
+<meta name="description" content="Free, open-source configurator for Ranked magnetic (Hall-effect) keyboards. Runs in Chrome or Edge via WebHID.">
+<style>
+:root {
+  --bg: #f5f6f8; --panel: #ffffff; --panel-2: #eef0f4; --text: #1b1e24; --muted: #646b78;
+  --line: #d9dde5; --accent: #2f6fed; --accent-text: #ffffff; --danger: #c93a3a; --ok: #1f8a4c;
+  --warn: #a86b00; --key: #ffffff; --key-line: #c8cdd7; --key-text: #1b1e24; --sel: #2f6fed;
+  --shadow: 0 1px 2px rgba(0,0,0,.06), 0 2px 8px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111317; --panel: #1a1d23; --panel-2: #22262e; --text: #e7e9ee; --muted: #9aa1ad;
+    --line: #2e333c; --accent: #5b8cff; --accent-text: #0b0d10; --danger: #ff6b6b; --ok: #4cc488;
+    --warn: #f0b43c; --key: #262a32; --key-line: #3a404b; --key-text: #e7e9ee; --sel: #7ea6ff;
+    --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111317; --panel: #1a1d23; --panel-2: #22262e; --text: #e7e9ee; --muted: #9aa1ad;
+  --line: #2e333c; --accent: #5b8cff; --accent-text: #0b0d10; --danger: #ff6b6b; --ok: #4cc488;
+  --warn: #f0b43c; --key: #262a32; --key-line: #3a404b; --key-text: #e7e9ee; --sel: #7ea6ff;
+  --shadow: none;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+a { color: var(--accent); }
+button, input, select, textarea { font: inherit; color: inherit; }
+.wrap { max-width: 1100px; margin: 0 auto; padding: 0 16px; }
+
+header { border-bottom: 1px solid var(--line); background: var(--panel); }
+header .wrap { display: flex; align-items: center; gap: 12px; padding-top: 12px; padding-bottom: 12px; flex-wrap: wrap; }
+header h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+header h1 span { color: var(--muted); font-weight: 500; }
+.spacer { flex: 1; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+  background: var(--panel-2); color: var(--muted); font-size: 13px; white-space: nowrap; }
+.pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.pill.on { color: var(--ok); } .pill.on::before { background: var(--ok); }
+.pill.demo { color: var(--warn); } .pill.demo::before { background: var(--warn); }
+
+.btn { border: 1px solid var(--line); background: var(--panel); padding: 7px 12px; border-radius: 8px;
+  cursor: pointer; white-space: nowrap; }
+.btn:hover { border-color: var(--muted); }
+.btn.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+.btn.danger { color: var(--danger); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn.small { padding: 4px 9px; font-size: 13px; }
+.btn.dirty { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent); }
+
+.banner { margin: 16px 0 0; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--panel); }
+.banner.warn { border-color: color-mix(in srgb, var(--warn) 50%, var(--line)); }
+
+nav.tabs { display: flex; gap: 4px; margin: 16px 0 12px; overflow-x: auto; scrollbar-width: none; }
+nav.tabs button { border: 0; background: transparent; padding: 8px 12px; border-radius: 8px; cursor: pointer;
+  color: var(--muted); white-space: nowrap; }
+nav.tabs button[aria-selected="true"] { background: var(--panel); color: var(--text); box-shadow: var(--shadow);
+  outline: 1px solid var(--line); }
+
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; box-shadow: var(--shadow); }
+.stack > * + * { margin-top: 12px; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+label.field { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+label.field > span b { color: var(--text); font-weight: 600; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+input[type=text], input[type=number], select, textarea { background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 9px; width: 100%; min-width: 0; }
+textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; resize: vertical; }
+input[type=color] { width: 44px; height: 34px; padding: 2px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.muted { color: var(--muted); }
+.small { font-size: 12.5px; }
+h2 { font-size: 15px; margin: 0 0 4px; }
+h3 { font-size: 13px; margin: 0; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+details summary { cursor: pointer; color: var(--muted); }
+
+/* keyboard */
+.kbwrap { overflow-x: auto; padding-bottom: 4px; }
+.kb { position: relative; width: 100%; min-width: 640px; aspect-ratio: 627 / 215; user-select: none; -webkit-user-select: none; touch-action: none; }
+.key { position: absolute; border: 1px solid var(--key-line); border-radius: 6px; background: var(--key);
+  color: var(--key-text); display: flex; flex-direction: column; justify-content: space-between;
+  padding: 3px 5px; overflow: hidden; cursor: pointer; transition: box-shadow .08s; }
+.key .n { font-size: 11.5px; font-weight: 600; line-height: 1.1; }
+.key .v { font-size: 10.5px; line-height: 1.1; opacity: .85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.key .v.dim { opacity: .35; }
+.key.sel { box-shadow: 0 0 0 2px var(--sel), inset 0 0 0 1px var(--sel); }
+.key .bar { position: absolute; left: 0; right: 0; bottom: 0; background: color-mix(in srgb, var(--accent) 55%, transparent); pointer-events: none; }
+.key .n, .key .v { position: relative; }
+.key.noisy { border-color: var(--warn); }
+.kbtools { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+
+.swatches { display: flex; gap: 6px; flex-wrap: wrap; }
+.sw { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--line); cursor: pointer; }
+
+table.t { border-collapse: collapse; width: 100%; font-size: 13px; }
+table.t td, table.t th { border-bottom: 1px solid var(--line); padding: 6px 6px; text-align: left; vertical-align: top; }
+table.t th { color: var(--muted); font-weight: 600; }
+
+.log { font-family: ui-monospace, Menlo, monospace; font-size: 12px; max-height: 420px; overflow: auto;
+  white-space: pre; background: var(--panel-2); padding: 10px; border-radius: 8px; }
+.log .rx { color: var(--ok); } .log .tx { color: var(--accent); } .log .er { color: var(--danger); }
+
+#toast { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 10; width: min(380px, calc(100% - 32px)); }
+.toast { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent);
+  padding: 10px 14px; border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.18); }
+.toast.err { border-left-color: var(--danger); } .toast.ok { border-left-color: var(--ok); }
+
+footer { margin: 28px 0 40px; color: var(--muted); font-size: 12.5px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>Ranked HE Configurator <span>· Master 65%</span></h1>
+    <div class="spacer"></div>
+    <span id="status" class="pill">Not connected</span>
+    <button id="btnDemo" class="btn">Demo</button>
+    <button id="btnConnect" class="btn primary">Connect keyboard</button>
+  </div>
+</header>
+
+<main class="wrap">
+  <div id="noHid" class="banner warn" hidden>
+    <b>This browser can't talk to USB keyboards.</b> Open this page in <b>Chrome</b>, <b>Edge</b>,
+    <b>Brave</b> or another Chromium browser on desktop (WebHID). You can still look around with
+    <b>Demo</b>.
+  </div>
+  <div id="intro" class="banner">
+    Plug the keyboard in <b>by cable</b>, click <b>Connect keyboard</b> and choose
+    <i>Master 65% US Keyboard</i>. Settings are written straight to the keyboard and stay there.
+    The keyboard can't report its settings back, so this page remembers what it wrote (in this
+    browser). Use <b>Profiles → Settings file</b> to share it with the <code>ranked.py</code> tool.
+  </div>
+
+  <nav class="tabs" role="tablist" id="tabs">
+    <button data-tab="lighting" aria-selected="true">Lighting</button>
+    <button data-tab="rgb">Per-key RGB</button>
+    <button data-tab="trigger">Actuation &amp; RT</button>
+    <button data-tab="keymap">Keymap</button>
+    <button data-tab="macros">Macros</button>
+    <button data-tab="options">Options</button>
+    <button data-tab="profiles">Profiles</button>
+    <button data-tab="log">Log</button>
+  </nav>
+
+  <!-- shared keyboard (rgb / trigger / keymap) -->
+  <section id="kbCard" class="card" hidden>
+    <div class="kbtools">
+      <span class="muted small" id="kbHint">Click or drag to select keys.</span>
+      <div class="spacer"></div>
+      <select id="selGroup" class="small" style="width:auto">
+        <option value="">Select group…</option>
+      </select>
+      <button class="btn small" id="selAll">All</button>
+      <button class="btn small" id="selNone">None</button>
+    </div>
+    <div class="kbwrap"><div class="kb" id="kb"></div></div>
+  </section>
+
+  <!-- LIGHTING -->
+  <section class="panel card stack" data-panel="lighting">
+    <div><h2>Lighting effect</h2><div class="muted small">Built-in effects. Per-key colours are on the next tab.</div></div>
+    <div class="grid2">
+      <label class="field"><span>Effect</span><select id="ledMode"></select></label>
+      <label class="field"><span>Colour</span><select id="ledColor"></select></label>
+      <label class="field"><span>Speed <b id="ledSpeedV"></b></span><input type="range" id="ledSpeed" min="0" max="9"></label>
+      <label class="field"><span>Brightness <b id="ledBrightV"></b></span><input type="range" id="ledBright" min="0" max="9"></label>
+    </div>
+    <div class="row"><button class="btn primary" id="ledApply">Apply</button>
+      <span class="muted small" id="ledHint"></span></div>
+  </section>
+
+  <!-- RGB -->
+  <section class="panel card stack" data-panel="rgb" hidden>
+    <div class="row">
+      <input type="color" id="rgbColor" value="#ff0000">
+      <div class="swatches" id="rgbSwatches"></div>
+    </div>
+    <div class="row">
+      <button class="btn" id="rgbPaint">Paint selected</button>
+      <button class="btn" id="rgbOthers">Paint all others</button>
+      <button class="btn" id="rgbOffSel">Turn off selected</button>
+      <button class="btn danger" id="rgbAllOff">All off</button>
+      <label class="row small muted"><input type="checkbox" id="rgbClickPaint"> click paints directly</label>
+    </div>
+    <div class="grid2">
+      <label class="field"><span>Brightness <b id="rgbBrightV"></b></span><input type="range" id="rgbBright" min="0" max="9"></label>
+    </div>
+    <div class="row"><button class="btn primary" id="rgbWrite">Write to keyboard</button>
+      <button class="btn" id="rgbRevert">Revert</button><span class="muted small" id="rgbInfo"></span></div>
+  </section>
+
+  <!-- TRIGGER -->
+  <section class="panel card stack" data-panel="trigger" hidden>
+    <div class="grid2">
+      <label class="field"><span>Actuation point <b id="tActV"></b></span><input type="range" id="tAct" min="2" max="38"></label>
+      <label class="field"><span>Rapid trigger: press <b id="tPressV"></b></span><input type="range" id="tPress" min="0" max="36"></label>
+      <label class="field"><span>Rapid trigger: release <b id="tRelV"></b></span><input type="range" id="tRel" min="0" max="36"></label>
+    </div>
+    <div class="muted small">With rapid trigger on, the first press happens at actuation + press sensitivity
+      (firmware behaviour). Readings top out near 4.0 mm, so keep actuation ≤ 3.6 mm. 0.1 mm RT is at sensor-noise level.</div>
+    <div class="row">
+      <button class="btn" id="tApplySel">Apply to selected keys</button>
+      <button class="btn" id="tPick">Load from first selected</button>
+      <button class="btn" id="tFactory">Factory values (all)</button>
+    </div>
+    <div class="row"><button class="btn primary" id="tWrite">Write to keyboard</button>
+      <button class="btn" id="tRevert">Revert</button><span class="muted small" id="tInfo"></span></div>
+    <hr style="border:0;border-top:1px solid var(--line)">
+    <div class="row">
+      <button class="btn" id="tLive">Show live key travel</button>
+      <button class="btn" id="tNoise">Measure noise (10 s)</button>
+      <button class="btn" id="tNoiseFix" hidden>Raise RT on noisy keys</button>
+      <span class="muted small" id="tLiveInfo"></span>
+    </div>
+  </section>
+
+  <!-- KEYMAP -->
+  <section class="panel card stack" data-panel="keymap" hidden>
+    <div class="row">
+      <h3>Layer</h3>
+      <div class="row" id="layerBtns"></div>
+      <label class="row small muted" id="baseOkWrap"><input type="checkbox" id="baseOk"> allow base-layer edits</label>
+    </div>
+    <div class="grid2">
+      <label class="field"><span>Assign</span>
+        <input type="text" id="mapTarget" list="targetList" placeholder="e.g. f13, cmd+c, play, macro:sig*2">
+        <datalist id="targetList"></datalist></label>
+      <label class="field"><span>Pick from list</span>
+        <div class="row" style="flex-wrap:nowrap">
+          <select id="mapCat"></select><select id="mapPick"></select>
+        </div></label>
+    </div>
+    <div class="row">
+      <button class="btn" id="mapAssign">Assign to selected</button>
+      <button class="btn" id="mapDefault">Factory default</button>
+      <button class="btn" id="mapClear">Unset</button>
+    </div>
+    <div class="row"><button class="btn primary" id="mapWrite">Write to keyboard</button>
+      <button class="btn" id="mapRevert">Revert</button><span class="muted small" id="mapInfo"></span></div>
+    <div class="muted small">On a Mac, Win = Cmd and Alt = Option. If you swapped them in macOS, combos get swapped
+      too (use <code>opt+c</code> for Cmd+C). Fn1 + Win toggles Win-lock. Fn and Fn2 can't be remapped on the base layer.</div>
+  </section>
+
+  <!-- MACROS -->
+  <section class="panel stack" data-panel="macros" hidden>
+    <div class="card stack">
+      <h2>Macros</h2>
+      <table class="t" id="macroTable"></table>
+      <div class="muted small">Bind a macro on the Keymap tab: <code>macro:NAME</code> (once), <code>macro:NAME*3</code>,
+        <code>macro:NAME@hold</code> (repeat while held), <code>macro:NAME@toggle</code> (until any key).</div>
+    </div>
+    <div class="card stack">
+      <div class="grid2">
+        <label class="field"><span>Name</span><input type="text" id="mName" placeholder="sig"></label>
+        <label class="field"><span>Pause after each tap (ms)</span><input type="number" id="mGap" value="10" min="0" max="1000"></label>
+      </div>
+      <label class="field"><span>Steps</span><textarea id="mSteps" rows="3" placeholder='text:"Hello world" 200ms enter'></textarea></label>
+      <div class="muted small" id="mPreview"></div>
+      <div class="row"><button class="btn primary" id="mSave">Save macro</button>
+        <button class="btn danger" id="mDelete">Delete</button>
+        <label class="row small muted"><input type="checkbox" id="mForce"> also unbind from keys</label></div>
+      <details><summary>Step syntax</summary>
+        <table class="t small" style="margin-top:8px">
+          <tr><td><code>a</code> <code>cmd+c</code> <code>f13</code></td><td>tap a key or combo</td></tr>
+          <tr><td><code>text:"Hi there!"</code></td><td>type text (US layout)</td></tr>
+          <tr><td><code>250ms</code></td><td>wait</td></tr>
+          <tr><td><code>down:shift</code> <code>up:shift</code></td><td>hold / release</td></tr>
+          <tr><td><code>click:left</code> <code>mdown:right</code> <code>mup:right</code></td><td>mouse buttons (left/right/middle)</td></tr>
+          <tr><td><code>wheel:up</code> <code>wheel:down*3</code></td><td>scroll</td></tr>
+        </table></details>
+    </div>
+  </section>
+
+  <!-- OPTIONS -->
+  <section class="panel card stack" data-panel="options" hidden>
+    <label class="row"><input type="checkbox" id="oCaps"> Caps Lock LED</label>
+    <details><summary>Advanced (hidden for this model in the official app; no visible effect on the Master 65%)</summary>
+      <div class="grid2" style="margin-top:10px">
+        <label class="row"><input type="checkbox" id="oTap"> Tap mode</label>
+        <label class="field"><span>Tap time <b id="oTapTimeV"></b></span><input type="range" id="oTapTime" min="0" max="100"></label>
+        <label class="field"><span>Debounce <b id="oDebV"></b></span><input type="range" id="oDeb" min="0" max="5"></label>
+        <label class="field"><span>Magic Fn</span><select id="oMagic"><option value="0">0 (off)</option><option value="1">1</option><option value="2">2</option></select></label>
+      </div></details>
+    <div class="row"><button class="btn primary" id="oApply">Apply</button>
+      <button class="btn" id="oDefaults">Official app defaults</button></div>
+  </section>
+
+  <!-- PROFILES -->
+  <section class="panel stack" data-panel="profiles" hidden>
+    <div class="card stack">
+      <h2>Profiles</h2>
+      <table class="t" id="profTable"></table>
+      <div class="row">
+        <input type="text" id="pName" placeholder="name, e.g. mac" style="max-width:220px">
+        <label class="small muted row"><input type="checkbox" class="pSec" value="triggers" checked>actuation</label>
+        <label class="small muted row"><input type="checkbox" class="pSec" value="keymap" checked>keymap + macros</label>
+        <label class="small muted row"><input type="checkbox" class="pSec" value="options" checked>options</label>
+        <label class="small muted row"><input type="checkbox" class="pSec" value="lighting" checked>lighting</label>
+        <button class="btn primary" id="pSave">Save current</button>
+      </div>
+      <div class="row"><label class="btn">Import profile… <input type="file" id="pImport" accept=".json" hidden></label>
+        <span class="muted small">Profile files are compatible with <code>profiles/NAME.json</code> from ranked.py.</span></div>
+    </div>
+    <div class="card stack">
+      <h2>Settings file</h2>
+      <div class="muted small">What this page believes is on the keyboard. Same format as <code>ranked_state.json</code>.
+        After a Fn2+Esc reset or using the official app, this goes stale: load a profile to re-sync.</div>
+      <div class="row">
+        <button class="btn" id="sExport">Export ranked_state.json</button>
+        <label class="btn">Import ranked_state.json… <input type="file" id="sImport" accept=".json" hidden></label>
+        <button class="btn danger" id="sForget">Forget (assume factory)</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- LOG -->
+  <section class="panel card stack" data-panel="log" hidden>
+    <div class="row"><h2>USB traffic</h2><div class="spacer"></div><button class="btn small" id="logClear">Clear</button></div>
+    <div class="log" id="log"></div>
+  </section>
+
+  <footer>
+    Unofficial and not affiliated with Ranked. Only whitelisted commands can be sent: firmware/bootloader
+    and reset commands are blocked. If anything goes wrong, hold <b>Fn2 + Esc for 5 s</b> to reset the keyboard.
+    · <a href="https://github.com/" id="repoLink">Source on GitHub</a>
+  </footer>
+</main>
+<div id="toast"></div>
+<script src="core.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
