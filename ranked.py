@@ -171,6 +171,9 @@ class Keyboard:
                    or p[:2] == bytes([0xB6, 0x03])   # AskTrigger (read-only)
                    or (p[0] == 0xB6 and p[1] in (0x01, 0x04, 0x05))  # trigger tables
                    or (p[0] == 0xB5 and len(p) == 9 and p[7:9] == b"\x00\x01")  # options
+                   or p == bytes([0xAA, 0x00])                       # free all macros
+                   or (p[0] == 0xA7 and len(p) == 4)                 # allocate macro
+                   or (p[0] == 0xA8 and len(p) <= 63)                # macro data
                    or (p[:3] == bytes([0xA0, 0x02, 0x04]) and len(p) == 61
                        and p[4] == 0x0E and p[5] in (1, 2, 3, 5) and p[60] == 0xA5))  # keymap
         if not allowed:
@@ -604,8 +607,29 @@ def _default_layers():
     return {"base": base, "fn1": fn1, "fn2": fn2, "tap": [None] * 126}
 
 
+def _parse_macro_target(s):
+    """macro:NAME (once) | macro:NAME*N (N times) | macro:NAME@hold | macro:NAME@toggle"""
+    import re
+    m = re.fullmatch(r"macro:([a-z0-9_.-]+)(?:\*(\d+)|@(hold|toggle))?", s)
+    if not m:
+        sys.exit("Macro target: macro:NAME, macro:NAME*3, macro:NAME@hold, macro:NAME@toggle")
+    name, count, mode = m.group(1), m.group(2), m.group(3)
+    if name not in _read_state_file().get("macros", {}):
+        sys.exit(f"No macro '{name}'. Create it first: python ranked.py macro add {name} \"...\"")
+    if mode == "hold":
+        return ("M", name, 0xF1, 0)          # repeat while the key is held
+    if mode == "toggle":
+        return ("M", name, 0xF0, 0)          # repeat until any key is pressed
+    n = int(count or 1)
+    if not 1 <= n <= 65535:
+        sys.exit("Repeat count must be 1..65535")
+    return ("M", name, 0xF3, n)              # play N times
+
+
 def _parse_target(spec):
     s = spec.strip().lower()
+    if s.startswith("macro:"):
+        return _parse_macro_target(s)
     if s in ("none", "clear", "transparent"):
         return None
     if s in ("disable", "off"):
@@ -655,6 +679,10 @@ def _parse_target(spec):
 def _describe(rec):
     if rec is None:
         return "-"
+    if rec[0] == "M":
+        _, name, mode, n = rec
+        return f"macro:{name}" + {0xF1: "@hold", 0xF0: "@toggle"}.get(
+            mode, "" if n == 1 else f"*{n}")
     c0, c1, c2, c3 = rec
     if c0 == 0xFF:
         return "Fn"
@@ -682,18 +710,22 @@ def _load_layers():
     return _default_layers(), False
 
 
-def _layer_packets(layer, recs):
+def _layer_packets(layer, recs, ids=None):
     block = bytearray(756)
     for idx, r in enumerate(recs):
-        if r:
-            block[idx * 6:idx * 6 + 6] = bytes([idx, *r, 0])
+        if not r:
+            continue
+        if r[0] == "M":                       # [idx][F3|F1|F0][buffer id][cnt_hi][cnt_lo][00]
+            _, name, mode, n = r
+            r = (mode, ids[name], n >> 8, n & 0xFF)
+        block[idx * 6:idx * 6 + 6] = bytes([idx, *r, 0])
     for pkt in range(1, 15):
         chunk = bytes(block[(pkt - 1) * 54:pkt * 54])
         yield bytes([0xA0, 0x02, 0x04, pkt, 0x0E, LAYER_IDS[layer]]) + chunk + bytes([0xA5])
 
 
-def _send_layer(layer, recs, dry_run=False, verbose=False):
-    pk = list(_layer_packets(layer, recs))
+def _send_layer(layer, recs, dry_run=False, verbose=False, ids=None):
+    pk = list(_layer_packets(layer, recs, ids))
     if dry_run:
         nz = [i for i, r in enumerate(recs) if r]
         print(f"would send layer {layer} (ID {LAYER_IDS[layer]}): 14 packets, "
@@ -757,9 +789,13 @@ def cmd_map_set(a):
     for p, rec in zip(keys, targets):
         layers[a.layer][p] = rec
         print(f"{a.layer}: {KEY_AT[p]} -> {_describe(rec)}")
-    if _send_layer(a.layer, layers[a.layer], a.dry_run, a.verbose) and not a.dry_run:
-        _save_state({"layers": {k: [list(r) if r else None for r in v] for k, v in layers.items()}})
+    if _apply_keymap(layers, [a.layer], a.dry_run, a.verbose) and not a.dry_run:
+        _save_layers(layers)
         print("OK - written and saved.")
+
+
+def _save_layers(layers):
+    _save_state({"layers": {k: [list(r) if r else None for r in v] for k, v in layers.items()}})
 
 
 def cmd_map_reset(a):
@@ -769,11 +805,286 @@ def cmd_map_reset(a):
     for L in names:
         layers[L] = d[L]
         print(f"restoring factory {L} layer")
-        if not _send_layer(L, layers[L], a.dry_run, a.verbose):
-            return
-    if not a.dry_run:
-        _save_state({"layers": {k: [list(r) if r else None for r in v] for k, v in layers.items()}})
+    if _apply_keymap(layers, names, a.dry_run, a.verbose) and not a.dry_run:
+        _save_layers(layers)
         print("OK")
+
+
+# ---------------------------------------------------------------- macros (AA / A7 / A8)
+# protocol.md 8.5. Blob: 01 + 30 x 00 (name area) + events:
+#   key down 02 <usage> | key up 03 <usage> | mouse down 04 <1 L|2 R|3 M> | mouse up 05 <btn>
+#   wheel 08 00 / 09 00 (one notch each) | delay 01 <ms hi> <ms lo> (follows an event)
+# Upload: AA 00 (free all) -> per macro: A7 <id> <size+5 hi> <lo> (reply byte 2 == 01) ->
+#         A8 <id> 00 <pkt 1..n> <n> <len<=57> <data>. Bound in a layer as F3/F1/F0 <id> <cnt>.
+MACRO_MAX = 0x200          # per macro
+MACRO_MEMORY = 0x1000      # Dev.ini MacroBufferSize default (not set for this model)
+MOD_USAGE = {"lctrl": 0xE0, "lshift": 0xE1, "lalt": 0xE2, "lwin": 0xE3,
+             "rctrl": 0xE4, "rshift": 0xE5, "ralt": 0xE6, "rwin": 0xE7}
+MOUSE_BTN = {"left": 1, "right": 2, "middle": 3}
+SHIFTED = {"!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7", "*": "8",
+           "(": "9", ")": "0", "_": "-", "+": "=", "{": "[", "}": "]", "|": "\\", ":": ";",
+           '"': "'", "~": "`", "<": ",", ">": ".", "?": "/"}
+
+
+def _usage(name):
+    n = MOD_ALIASES.get(name, name)
+    if n in MOD_USAGE:
+        return MOD_USAGE[n]
+    if n in TARGET_HID:
+        return TARGET_HID[n]
+    sys.exit(f"Unknown key '{name}' in macro")
+
+
+def _char_usages(ch):
+    """usages (modifiers first) needed to type one character on a US layout"""
+    if ch == " ":
+        return [0x2C]
+    if ch == "\n":
+        return [0x28]
+    if ch == "\t":
+        return [0x2B]
+    if ch.isalpha() and ch.isascii():
+        return [0xE1, TARGET_HID[ch.lower()]] if ch.isupper() else [TARGET_HID[ch]]
+    if ch in SHIFTED:
+        return [0xE1, TARGET_HID[SHIFTED[ch]]]
+    if ch in TARGET_HID:
+        return [TARGET_HID[ch]]
+    sys.exit(f"Can't type character {ch!r} in a text: step")
+
+
+def _compile_macro(spec, gap_ms=10):
+    """Turn a step string into (events, blob). Steps are separated by spaces:
+       cmd+c  a  kp+     tap a key/combo (modifiers pressed first, released last)
+       text:"Hi there"   type text (US layout)
+       250ms             wait (added after the previous step)
+       down:shift up:shift   hold / release a key
+       click:left  mdown:right  mup:right   mouse buttons (left/right/middle)
+       wheel:up  wheel:down*3              scroll
+    """
+    import re
+    import shlex
+    ev = []          # [bytes, delay_ms]
+
+    def add(b, delay=0):
+        ev.append([bytes(b), delay])
+
+    def tap(usages):
+        for u in usages:
+            add([0x02, u])
+        for u in reversed(usages):
+            add([0x03, u])
+        ev[-1][1] = gap_ms
+
+    try:
+        tokens = shlex.split(spec)
+    except ValueError as e:
+        sys.exit(f"Macro steps: {e}")
+    for t in tokens:
+        tl = t.lower()
+        if m := re.fullmatch(r"(\d+)ms", tl):
+            if not ev:
+                sys.exit("A macro can't start with a delay")
+            ev[-1][1] = min(int(m.group(1)), 65535)
+        elif tl.startswith("text:"):
+            for ch in t[5:]:
+                tap(_char_usages(ch))
+        elif tl.startswith(("down:", "up:")):
+            kind, k = tl.split(":", 1)
+            add([0x02 if kind == "down" else 0x03, _usage(k)])
+        elif tl.startswith(("click:", "mdown:", "mup:")):
+            kind, b = tl.split(":", 1)
+            if b not in MOUSE_BTN:
+                sys.exit(f"Mouse button must be left/right/middle, not '{b}'")
+            if kind in ("click", "mdown"):
+                add([0x04, MOUSE_BTN[b]])
+            if kind in ("click", "mup"):
+                add([0x05, MOUSE_BTN[b]])
+            ev[-1][1] = gap_ms
+        elif m := re.fullmatch(r"wheel:(up|down)(?:\*(\d+))?", tl):
+            # one byte per notch: "08 00" made the firmware stop after the first scroll
+            # (the 00 apparently reads as end-of-macro) - observed on the device
+            for _ in range(int(m.group(2) or 1)):
+                add([0x08 if m.group(1) == "up" else 0x09])
+            ev[-1][1] = gap_ms
+        elif tl.startswith("raw:"):
+            # experimental: raw event bytes in hex, e.g. raw:08 or raw:0803
+            try:
+                b = bytes.fromhex(tl[4:])
+            except ValueError:
+                sys.exit(f"raw: needs hex bytes, e.g. raw:08 (got '{t}')")
+            if not b or b[0] in (0x00,):
+                sys.exit("raw: can't be empty or start with 00")
+            add(b)
+        else:   # key or combo, same names as map --to (cmd+c, kp+, f13...)
+            if tl in TARGET_HID:
+                tap([TARGET_HID[tl]])
+                continue
+            parts = []
+            for tok in tl.split("+"):
+                if tok == "" and parts:
+                    parts[-1] += "+"
+                else:
+                    parts.append(tok)
+            us = [_usage(p) for p in parts]
+            tap(sorted(us, key=lambda u: u < 0xE0))   # modifiers first
+    if not ev:
+        sys.exit("Empty macro")
+    blob = bytearray([0x01] + [0] * 30)
+    for b, d in ev:
+        blob += b
+        if d:
+            blob += bytes([0x01, d >> 8, d & 0xFF])
+    if len(blob) > MACRO_MAX:
+        sys.exit(f"Macro is {len(blob)} bytes; the limit is {MACRO_MAX}. "
+                 "Shorten it or use --gap 0.")
+    return ev, bytes(blob)
+
+
+def _macro_refs(layers):
+    return sorted({r[1] for recs in layers.values() for r in recs if r and r[0] == "M"})
+
+
+def _upload_macros(names, dry_run=False, verbose=False):
+    import time
+    macros = _read_state_file().get("macros", {})
+    blobs = {}
+    for n in names:
+        if n not in macros:
+            sys.exit(f"Keymap uses macro '{n}' but it isn't defined (macro add {n} ...)")
+        blobs[n] = _compile_macro(macros[n]["steps"], macros[n].get("gap", 10))[1]
+    total = sum(len(b) + 5 for b in blobs.values())
+    if total > MACRO_MEMORY:
+        sys.exit(f"Bound macros need {total} bytes; the keyboard has about {MACRO_MEMORY}.")
+    ids = {n: i + 1 for i, n in enumerate(names)}
+    if dry_run:
+        print(f"would send AA 00 (free all macros), then {len(names)} macro(s), {total} bytes:")
+        for n in names:
+            print(f"   id {ids[n]} {n}: {len(blobs[n])} bytes, "
+                  f"{-(-len(blobs[n]) // 57)} packet(s)")
+        return ids
+    kb = Keyboard()
+    try:
+        kb.handshake(verbose=verbose)
+        if not kb.send(bytes([0xAA, 0x00]), verbose=verbose):
+            sys.exit("No acknowledgement freeing macro memory - stopping.")
+        time.sleep(0.12)
+        for n in names:
+            b, mid = blobs[n], ids[n]
+            time.sleep(0.03)
+            sz = len(b) + 5
+            r = kb.send(bytes([0xA7, mid, sz >> 8, sz & 0xFF]), verbose=verbose)
+            if not r or r[2] != 0x01:
+                sys.exit(f"Keyboard has no room for macro '{n}' - stopping.")
+            time.sleep(0.1)
+            chunks = [b[i:i + 57] for i in range(0, len(b), 57)]
+            for k, c in enumerate(chunks, 1):
+                time.sleep(0.02)
+                if not kb.send(bytes([0xA8, mid, 0x00, k, len(chunks), len(c)]) + c,
+                               verbose=verbose):
+                    sys.exit(f"No acknowledgement uploading macro '{n}' - stopping.")
+            print(f"  macro {n}: uploaded ({len(b)} bytes)")
+    finally:
+        kb.close()
+    return ids
+
+
+def _apply_keymap(layers, send, dry_run=False, verbose=False):
+    """Send the given layers. If any layer uses macros, (re)upload all bound macros and
+    resend every layer that references one (their buffer IDs are reassigned each time)."""
+    refs = _macro_refs(layers)
+    ids = {n: i + 1 for i, n in enumerate(refs)}
+    todo = list(dict.fromkeys(list(send) + [L for L in LAYER_IDS
+                                           if any(r and r[0] == "M" for r in layers[L])]))
+    for L in todo:
+        if not _send_layer(L, layers[L], dry_run, verbose, ids):
+            return False
+        if not dry_run:
+            print(f"  keymap {L}: written")
+    if refs:
+        _upload_macros(refs, dry_run, verbose)
+    return True
+
+
+def cmd_macro_add(a):
+    _compile_macro(a.steps, a.gap)      # validate first
+    s = _read_state_file()
+    macros = s.get("macros", {})
+    name = a.name.lower()
+    import re
+    if not re.fullmatch(r"[a-z0-9_.-]+", name):
+        sys.exit("Macro names: letters, digits, _ . - only")
+    if name in macros and not a.force:
+        sys.exit(f"Macro '{name}' exists; add --force to replace it.")
+    macros[name] = {"steps": a.steps, "gap": a.gap}
+    _save_state({"macros": macros})
+    print(f"Saved macro '{name}'.")
+    layers, known = _load_layers()
+    if known and name in _macro_refs(layers):
+        print("It's bound to a key - uploading the new version...")
+        _apply_keymap(layers, [], False, a.verbose)
+    else:
+        print(f"Bind it with: python ranked.py map set --layer fn2 --key X --to macro:{name}")
+
+
+def cmd_macro_list(a):
+    macros = _read_state_file().get("macros", {})
+    if not macros:
+        print("No macros yet. Example: python ranked.py macro add copy \"cmd+c\"")
+        return
+    layers, _ = _load_layers()
+    bound = {}
+    for L, recs in layers.items():
+        for p, r in enumerate(recs):
+            if r and r[0] == "M":
+                bound.setdefault(r[1], []).append(f"{L}:{KEY_AT.get(p, p)}")
+    for n, m in sorted(macros.items()):
+        size = len(_compile_macro(m["steps"], m.get("gap", 10))[1])
+        where = ", ".join(bound.get(n, [])) or "not bound"
+        print(f"  {n:<14} {size:>4} B  [{where}]  {m['steps']}")
+
+
+def cmd_macro_show(a):
+    m = _read_state_file().get("macros", {}).get(a.name.lower())
+    if not m:
+        sys.exit(f"No macro '{a.name}'.")
+    ev, blob = _compile_macro(m["steps"], m.get("gap", 10))
+    rev = {v: k for k, v in TARGET_HID.items()}
+    rev.update({v: k for k, v in MOD_USAGE.items()})
+    print(f"{a.name}: {m['steps']}   ({len(blob)} bytes, gap {m.get('gap', 10)} ms)")
+    for b, d in ev:
+        kind = {2: "down", 3: "up", 4: "mouse down", 5: "mouse up", 8: "wheel up",
+                9: "wheel down"}.get(b[0], "raw")
+        if kind == "raw" or (b[0] in (8, 9) and len(b) != 1):
+            kind, what = "raw", b.hex(" ")
+        elif b[0] in (2, 3):
+            what = rev.get(b[1], hex(b[1]))
+        elif b[0] in (4, 5):
+            what = {1: "left", 2: "right", 3: "middle"}.get(b[1], "")
+        else:
+            what = ""
+        print(f"  {kind:<10} {what:<8}" + (f" then wait {d} ms" if d else ""))
+
+
+def cmd_macro_delete(a):
+    s = _read_state_file()
+    macros = s.get("macros", {})
+    name = a.name.lower()
+    if name not in macros:
+        sys.exit(f"No macro '{name}'.")
+    layers, known = _load_layers()
+    if known and name in _macro_refs(layers):
+        sys.exit(f"'{name}' is bound to a key; unbind it first (map set ... --to default).")
+    del macros[name]
+    _save_state({"macros": macros})
+    print(f"Deleted '{name}'.")
+
+
+def cmd_macro_sync(a):
+    layers, known = _load_layers()
+    if not _macro_refs(layers):
+        print("No macros are bound to keys - nothing to upload.")
+        return
+    _apply_keymap(layers, [], a.dry_run, a.verbose)
 
 
 def cmd_modes(a):
@@ -833,6 +1144,9 @@ def _snapshot():
         snap["triggers"] = {k: s[k] for k in TABLES}
     if "layers" in s:
         snap["keymap"] = s["layers"]
+        used = {r[1] for v in s["layers"].values() for r in v if r and r[0] == "M"}
+        if used:   # bring along the macros the keymap needs
+            snap["macros"] = {n: m for n, m in s.get("macros", {}).items() if n in used}
     if "options" in s:
         snap["options"] = s["options"]
     if "lighting" in s:
@@ -860,7 +1174,8 @@ def _parse_only(spec):
 def cmd_profile_save(a):
     import json
     only = _parse_only(a.only)
-    snap = {k: v for k, v in _snapshot().items() if k in only}
+    snap = {k: v for k, v in _snapshot().items()
+            if k in only or (k == "macros" and "keymap" in only)}
     if not snap:
         sys.exit("Nothing to save yet - this tool hasn't written any of those settings.")
     path = _profile_path(a.name)
@@ -936,22 +1251,28 @@ def cmd_profile_load(a):
             _save_state(st)
 
     if "keymap" in only:
-        layers = {k: [tuple(r) if r else None for r in v] for k, v in p["keymap"].items()}
+        layers, _ = _load_layers()
+        layers.update({k: [tuple(r) if r else None for r in v] for k, v in p["keymap"].items()})
         cur_layers = cur.get("keymap")
+        # macro definitions travel with the keymap; profile versions win on name clashes
+        if p.get("macros"):
+            merged = dict(_read_state_file().get("macros", {}), **p["macros"])
+            if not a.dry_run:
+                _save_state({"macros": merged})
+        send = []
         for L in LAYER_IDS:
-            if L not in layers:
+            if L not in p["keymap"]:
                 continue
             # skip layers that already match what this tool last wrote (saves time)
             if cur_layers and not a.full and [tuple(r) if r else None
                                               for r in cur_layers.get(L, [])] == layers[L]:
                 print(f"  keymap {L}: unchanged, skipped")
                 continue
-            if not _send_layer(L, layers[L], a.dry_run, a.verbose):
-                sys.exit("stopping")
-            print(f"  keymap {L}: written")
+            send.append(L)
+        if not _apply_keymap(layers, send, a.dry_run, a.verbose):
+            sys.exit("stopping")
         if not a.dry_run:
-            _save_state({"layers": {k: [list(r) if r else None for r in v]
-                                    for k, v in layers.items()}})
+            _save_layers(layers)
     print("Done." if not a.dry_run else "(dry run - nothing sent)")
 
 
@@ -1000,6 +1321,8 @@ def cmd_profile_show(a):
                      if (tuple(r) if r else None) != d[L][i]]
             print(f"keymap {L}: " + (", ".join(f"{k}->{v}" for k, v in diffs)
                                       if diffs else "factory"))
+    for n, m in p.get("macros", {}).items():
+        print(f"macro {n}: {m['steps']}")
 
 
 def cmd_profile_delete(a):
@@ -1359,6 +1682,26 @@ def main():
     p4 = ps.add_parser("delete")
     p4.add_argument("name")
     p4.set_defaults(fn=cmd_profile_delete)
+
+    mc = sub.add_parser("macro", help="define macros; bind with map set --to macro:NAME")
+    mcs = mc.add_subparsers(dest="mccmd", required=True)
+    c1 = mcs.add_parser("add", help='e.g. macro add sig "text:\\"Best, Micha\\""')
+    c1.add_argument("name")
+    c1.add_argument("steps", help='space-separated: cmd+c  250ms  text:"hi"  down:shift  raw:08  '
+                                  'up:shift  click:left  wheel:down*3')
+    c1.add_argument("--gap", type=int, default=10, help="ms after each key tap (default 10)")
+    c1.add_argument("--force", action="store_true", help="replace an existing macro")
+    c1.set_defaults(fn=cmd_macro_add)
+    mcs.add_parser("list").set_defaults(fn=cmd_macro_list)
+    c2 = mcs.add_parser("show")
+    c2.add_argument("name")
+    c2.set_defaults(fn=cmd_macro_show)
+    c3 = mcs.add_parser("delete")
+    c3.add_argument("name")
+    c3.set_defaults(fn=cmd_macro_delete)
+    c4 = mcs.add_parser("sync", help="re-upload bound macros (e.g. after Fn2+Esc)")
+    c4.add_argument("--dry-run", action="store_true")
+    c4.set_defaults(fn=cmd_macro_sync)
 
     mp = sub.add_parser("map", help="key remapping per layer (base, fn1, fn2, tap)")
     ms = mp.add_subparsers(dest="mcmd", required=True)
