@@ -808,6 +808,201 @@ def cmd_led(a):
         print("OK - keyboard acknowledged." if r else "No acknowledgement (setting may not have applied).")
     finally:
         kb.close()
+    if r:
+        _save_state({"lighting": {"mode": a.mode, "speed": a.speed, "brightness": a.brightness,
+                                  "color": color}})
+
+
+# ---------------------------------------------------------------- profiles
+# A profile is a snapshot of what this tool last wrote (ranked_state.json), stored as
+# profiles/<name>.json next to this script. Loading writes it to the keyboard section by section.
+PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles")
+SECTIONS = ("triggers", "keymap", "options", "lighting")
+
+
+def _snapshot():
+    """Current state as profile sections; only sections this tool has written."""
+    s = _read_state_file()
+    snap = {}
+    if all(k in s for k in TABLES):
+        snap["triggers"] = {k: s[k] for k in TABLES}
+    if "layers" in s:
+        snap["keymap"] = s["layers"]
+    if "options" in s:
+        snap["options"] = s["options"]
+    if "lighting" in s:
+        snap["lighting"] = s["lighting"]
+    return snap
+
+
+def _profile_path(name):
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        sys.exit("Profile names: letters, digits, _ . - only")
+    return os.path.join(PROFILE_DIR, name + ".json")
+
+
+def _parse_only(spec):
+    if not spec:
+        return list(SECTIONS)
+    out = [x.strip().lower() for x in spec.split(",")]
+    bad = [x for x in out if x not in SECTIONS]
+    if bad:
+        sys.exit(f"Unknown section(s) {bad}; choose from {', '.join(SECTIONS)}")
+    return out
+
+
+def cmd_profile_save(a):
+    import json
+    only = _parse_only(a.only)
+    snap = {k: v for k, v in _snapshot().items() if k in only}
+    if not snap:
+        sys.exit("Nothing to save yet - this tool hasn't written any of those settings.")
+    path = _profile_path(a.name)
+    if os.path.exists(path) and not a.force:
+        sys.exit(f"Profile '{a.name}' exists; add --force to overwrite.")
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(snap, f, indent=1)
+    print(f"Saved '{a.name}': {', '.join(snap)}")
+    missing = [k for k in only if k not in snap]
+    if missing:
+        print(f"Not included (never set with this tool): {', '.join(missing)}")
+
+
+def _read_profile(name):
+    import json
+    path = _profile_path(name)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except OSError:
+        sys.exit(f"No profile '{name}'. See: python ranked.py profile list")
+
+
+def cmd_profile_load(a):
+    p = _read_profile(a.name)
+    only = [k for k in _parse_only(a.only) if k in p]
+    if not only:
+        sys.exit("That profile has none of the requested sections.")
+    cur = _snapshot()
+    print(f"Loading '{a.name}': {', '.join(only)}")
+
+    if "options" in only:
+        o = dict(OPT_DEFAULTS, **p["options"])
+        payload = _options_payload(o)
+        if a.dry_run:
+            print("  options: would send", hexs(payload))
+        else:
+            kb = Keyboard()
+            try:
+                kb.handshake()
+                ok = kb.send(payload)
+            finally:
+                kb.close()
+            if not ok:
+                sys.exit("  options: no acknowledgement - stopping")
+            _save_state({"options": o})
+            print("  options: written")
+
+    if "lighting" in only:
+        L = p["lighting"]
+        payload = build_led(L["mode"], L["speed"], L["brightness"], L["color"])
+        if a.dry_run:
+            print("  lighting: would send", hexs(payload))
+        else:
+            kb = Keyboard()
+            try:
+                kb.handshake()
+                ok = kb.send(payload)
+            finally:
+                kb.close()
+            if not ok:
+                sys.exit("  lighting: no acknowledgement - stopping")
+            _save_state({"lighting": L})
+            print("  lighting: written")
+
+    if "triggers" in only:
+        st = {k: list(p["triggers"][k]) for k in TABLES}
+        print("  triggers:")
+        if not _write_tables(st, list(TABLES), a.dry_run, a.verbose):
+            sys.exit("stopping")
+        if not a.dry_run:
+            _save_state(st)
+
+    if "keymap" in only:
+        layers = {k: [tuple(r) if r else None for r in v] for k, v in p["keymap"].items()}
+        cur_layers = cur.get("keymap")
+        for L in LAYER_IDS:
+            if L not in layers:
+                continue
+            # skip layers that already match what this tool last wrote (saves time)
+            if cur_layers and not a.full and [tuple(r) if r else None
+                                              for r in cur_layers.get(L, [])] == layers[L]:
+                print(f"  keymap {L}: unchanged, skipped")
+                continue
+            if not _send_layer(L, layers[L], a.dry_run, a.verbose):
+                sys.exit("stopping")
+            print(f"  keymap {L}: written")
+        if not a.dry_run:
+            _save_state({"layers": {k: [list(r) if r else None for r in v]
+                                    for k, v in layers.items()}})
+    print("Done." if not a.dry_run else "(dry run - nothing sent)")
+
+
+def cmd_profile_list(a):
+    import json
+    names = sorted(f[:-5] for f in os.listdir(PROFILE_DIR) if f.endswith(".json")) \
+        if os.path.isdir(PROFILE_DIR) else []
+    if not names:
+        print("No profiles yet. Save one with: python ranked.py profile save NAME")
+        return
+    cur = _snapshot()
+    for n in names:
+        with open(_profile_path(n)) as f:
+            p = json.load(f)
+        same = all(cur.get(k) == v for k, v in p.items())
+        print(f"  {n:<16} {', '.join(p)}{'   <- matches current' if same else ''}")
+
+
+def cmd_profile_show(a):
+    p = _read_profile(a.name)
+    if "lighting" in p:
+        L = p["lighting"]
+        cname = next((k for k, v in COLORS.items() if v == L["color"]), L["color"])
+        print(f"lighting: mode {L['mode']}, speed {L['speed']}, brightness {L['brightness']}, "
+              f"color {cname}")
+    if "options" in p:
+        o = p["options"]
+        print(f"options: caps LED {'on' if o.get('caps_led') else 'off'}, "
+              f"tap {'on' if o.get('tap') else 'off'} {o.get('tap_time', 0)*10} ms, "
+              f"debounce {o.get('debounce')}, magic Fn {o.get('magic_fn')}")
+    if "triggers" in p:
+        t = p["triggers"]
+        from collections import Counter
+        for k in TABLES:
+            vals = Counter(t[k][q] for q in KEY_AT)
+            common, n = vals.most_common(1)[0]
+            desc = "off" if k != "actuation" and common == 0 else f"{common/10:.1f} mm"
+            print(f"triggers {k}: {desc} on {n} keys" +
+                  ("" if n == len(KEY_AT) else ", others: " + ", ".join(
+                      f"{KEY_AT[q]}={t[k][q]/10:.1f}" for q in sorted(KEY_AT) if t[k][q] != common)))
+    if "keymap" in p:
+        d = _default_layers()
+        for L, recs in p["keymap"].items():
+            diffs = [(KEY_AT.get(i, f"pos{i}"), _describe(tuple(r) if r else None))
+                     for i, r in enumerate(recs)
+                     if (tuple(r) if r else None) != d[L][i]]
+            print(f"keymap {L}: " + (", ".join(f"{k}->{v}" for k, v in diffs)
+                                      if diffs else "factory"))
+
+
+def cmd_profile_delete(a):
+    path = _profile_path(a.name)
+    if not os.path.exists(path):
+        sys.exit(f"No profile '{a.name}'.")
+    os.remove(path)
+    print(f"Deleted '{a.name}'.")
 
 
 # ---------------------------------------------------------------- trigger settings
@@ -1138,6 +1333,27 @@ def main():
     rt.add_argument("--key", required=True)
     rt.add_argument("--seconds", type=float, default=60)
     rt.set_defaults(fn=cmd_rt_test)
+
+    pf = sub.add_parser("profile", help="save / load named setups")
+    ps = pf.add_subparsers(dest="pcmd", required=True)
+    p1 = ps.add_parser("save", help="snapshot what this tool last wrote")
+    p1.add_argument("name")
+    p1.add_argument("--only", help=f"comma list of: {', '.join(SECTIONS)} (default all)")
+    p1.add_argument("--force", action="store_true", help="overwrite existing profile")
+    p1.set_defaults(fn=cmd_profile_save)
+    p2 = ps.add_parser("load", help="write a profile to the keyboard")
+    p2.add_argument("name")
+    p2.add_argument("--only", help=f"comma list of: {', '.join(SECTIONS)} (default all)")
+    p2.add_argument("--full", action="store_true", help="resend keymap layers even if unchanged")
+    p2.add_argument("--dry-run", action="store_true")
+    p2.set_defaults(fn=cmd_profile_load)
+    ps.add_parser("list").set_defaults(fn=cmd_profile_list)
+    p3 = ps.add_parser("show")
+    p3.add_argument("name")
+    p3.set_defaults(fn=cmd_profile_show)
+    p4 = ps.add_parser("delete")
+    p4.add_argument("name")
+    p4.set_defaults(fn=cmd_profile_delete)
 
     mp = sub.add_parser("map", help="key remapping per layer (base, fn1, fn2, tap)")
     ms = mp.add_subparsers(dest="mcmd", required=True)
