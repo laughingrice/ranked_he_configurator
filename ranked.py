@@ -1875,7 +1875,7 @@ def main():
 
     mc = sub.add_parser("macro", help="define macros; bind with map set --to macro:NAME")
     mcs = mc.add_subparsers(dest="mccmd", required=True)
-    c1 = mcs.add_parser("add", help='e.g. macro add sig "text:\\"Best, Micha\\""')
+    c1 = mcs.add_parser("add", help='e.g. macro add sig "text:\\"Hello World\\""')
     c1.add_argument("name")
     c1.add_argument("steps", help='space-separated: cmd+c  250ms  text:"hi"  down:shift  raw:08  '
                                   'up:shift  click:left  wheel:down*3')
